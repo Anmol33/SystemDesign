@@ -128,6 +128,134 @@ Since PostgreSQL does not immediately delete old tuple versions, these obsolete 
   * Storage remains efficient.  
   * Performance doesn’t degrade due to large numbers of invisible rows.  
   * Without vacuum, MVCC would lead to unbounded growth in storage usage and degrade performance over time.
+ 
+# Understanding PostgreSQL's Transaction ID Wraparound Problem
+
+## Key Metadata Fields in PostgreSQL
+Every row (or **tuple**) in a PostgreSQL table stores two important metadata fields:
+
+- **xmin**: The transaction ID (XID) that created this version of the row.  
+- **xmax**: The transaction ID that deleted this version of the row.  
+  - If this value is `0`, the row version is currently **live** and has not been deleted.
+
+---
+
+## The Database Visibility Rule
+PostgreSQL decides if your current transaction can "see" a row using **visibility checks**:
+
+For a transaction with `current_xid`, a row is visible if:
+
+1. The row's `xmin` is **older than** `current_xid`.  
+2. The row's `xmax` is:
+   - `0` (row not deleted), OR  
+   - From a transaction that is in the **future** relative to yours.
+
+This creates a **linear timeline**, where:
+- Smaller XID numbers = past  
+- Larger XID numbers = future  
+
+---
+
+## Example: Before Wraparound
+Imagine a simple **products** table.  
+
+- Current transaction ID ≈ `3,000,000,000`.  
+- Query:  
+  ```sql
+  SELECT * FROM products;
+
+# PostgreSQL Wraparound: Worked Example in Markdown
+
+## Rows on disk (before wraparound)
+
+| product_id | product_name | xmin          | xmax |
+|------------|--------------|---------------|------|
+| 1          | Laptop       | 1,500,000,000 | 0    |
+| 2          | Mouse        | 2,500,000,000 | 0    |
+
+**Visibility check (current_xid ≈ 3,000,000,000):**
+- Laptop: `1.5B < 3B` ✅ and `xmax = 0` ✅ → **Visible**
+- Mouse: `2.5B < 3B` ✅ and `xmax = 0` ✅ → **Visible**
+
+✅ Both rows are returned correctly.
+
+---
+
+## The Wraparound Problem
+
+- PostgreSQL transaction IDs are **32-bit** and max out around **4.2 billion**.
+- Last committed transaction: `XID = 4,200,000,000`.
+- Counter wraps → new transaction gets: `current_xid = 100`.
+
+**Query again:**
+```sql
+SELECT * FROM products;
+```
+
+## Rows on Disk (Unchanged)
+
+| product_id | product_name | xmin          | xmax |
+|------------|--------------|---------------|------|
+| 1          | Laptop       | 1,500,000,000 | 0    |
+| 2          | Mouse        | 2,500,000,000 | 0    |
+
+---
+
+## Visibility Check After Wraparound (`current_xid = 100`)
+
+- Laptop: `1.5B < 100` ❌ → **Invisible**  
+- Mouse: `2.5B < 100` ❌ → **Invisible**
+
+⚠️ Both rows become **invisible**.  
+The data is still on disk but **logically inaccessible** → silent data loss.
+
+---
+
+## How VACUUM and `relfrozenxid` Prevent Wraparound
+
+- Each table has a **`relfrozenxid`** = oldest XID not yet frozen.  
+- Example: `relfrozenxid = 1,000,000,000`.
+
+**What VACUUM does:**
+1. Scans the table.  
+2. Finds rows where `xmin < relfrozenxid`.  
+3. Replaces `xmin` with **`FrozenTransactionId (2)`** (always considered in the past).  
+4. Advances `relfrozenxid` to a newer, safe value.  
+
+---
+
+## Example After VACUUM
+
+**Rows updated by VACUUM:**
+
+| product_id | product_name | xmin | xmax |
+|------------|--------------|------|------|
+| 1          | Laptop       | 2    | 0    |
+| 2          | Mouse        | 2    | 0    |
+
+➡️ `relfrozenxid` advanced to ~`3,500,000,000`.
+
+---
+
+## Visibility After Wraparound
+
+Even if `current_xid = 100`:
+
+- Laptop: `xmin = 2 < 100` ✅ → **Visible**  
+- Mouse: `xmin = 2 < 100` ✅ → **Visible**
+
+✅ Data remains safe and visible.
+
+---
+
+## Key Takeaways
+
+- PostgreSQL transaction IDs wrap around at ~**4.2B**.  
+- Without maintenance, old rows can **vanish logically** (wraparound bug).  
+- **VACUUM** prevents this by freezing rows and moving the **`relfrozenxid` horizon**.  
+- Regular **VACUUM/autovacuum** is critical to avoid catastrophic data loss.  
+
+
 
 ### **Conclusion**
 
