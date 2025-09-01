@@ -81,32 +81,53 @@ Initial state: id=1, name='Laptop', price=1000 (let's say xmin=100, xmax=0).
 
 ### **Concurrent Transaction Handling Examples**
 
+# **PostgreSQL Concurrency Handling with MVCC**
+
+### **Concurrent Transaction Handling Examples**
+
 #### **Read-Read Concurrency**
 
-* **Scenario:** TxA reads Row R. Concurrently, TxB reads Row R.  
-* **MVCC Handling:** Both TxA and TxB begin and take their own snapshots. Since no transaction is writing or modifying the row, both transactions see the same version of Row R as it existed when their snapshots were taken. No locks are required because no modification occurs.  
-* **Outcome:** High performance, no contention or blocking, and consistent data views for both transactions.
+* **Scenario:** Transaction A (TxA) reads Row R. Concurrently, Transaction B (TxB) reads Row R.  
+* **MVCC Handling:** Both TxA and TxB begin and take their own unique "snapshots" of the database state. Since no transaction is writing or modifying the row, both see the same committed version of Row R as it existed when their snapshots were taken. No locks are required because no modification occurs.  
+* **Outcome:** High performance with no contention or blocking. Both transactions get a consistent view of the data.
 
 #### **Read-Write Concurrency**
 
 * **Scenario:** TxA reads Row R while TxB concurrently updates it.  
 * **MVCC Handling:**  
-  * TxA starts and takes a snapshot of the database. It reads Row R.  
-  * TxB starts later (or concurrently), updates Row R, and creates a new tuple with its own xmin and marks the old tuple with its XID in xmax.  
-  * Since TxA had already taken its snapshot, it continues to see the old version of Row R (as xmax is not committed or outside its snapshot).  
-  * TxA is **not blocked** by TxB.  
-  * After TxB commits, new transactions that start will see the new version of Row R.  
-* **Outcome:** Snapshot isolation is maintained. Readers are not blocked by writers. No dirty reads.
+  * TxA starts and takes its snapshot of the database. It reads the original version of Row R.  
+  * TxB starts (concurrently or later), updates Row R, and creates a new version of the row tuple. It marks the old tuple as "deleted" for future transactions by setting its xmax.  
+  * Because TxA is operating on its older snapshot, it continues to see the original version of Row R and is **not blocked** by TxB's write lock.  
+  * After TxB commits, new transactions that start will see the new, updated version of Row R.  
+* **Outcome:** Snapshot isolation is maintained. **Readers do not block writers, and writers do not block readers.** This prevents "dirty reads" and is a core performance feature of MVCC.
 
 #### **Write-Write Concurrency**
 
-* **Scenario:** TxA and TxB both attempt to update Row R.  
-* **MVCC Handling:**  
-  * TxA begins and updates Row R first. It acquires an **exclusive row-level lock**.  
-  * TxB, which starts later and tries to update the same row, is **blocked** waiting for TxA to finish.  
-  * Once TxA commits (or aborts) and releases its lock, TxB can then acquire the lock and proceed with its update.  
-  * If TxA commits, TxB now sees the new version from TxA and applies its own update on top of it (creates yet another version).  
-  * If TxA aborts, TxB works on the original version.  
+* **Scenario:** TxA and TxB both attempt to update the same Row R.  
+* **MVCC Handling:** The outcome is determined by the **Transaction Isolation Level**.
+
+##### **Scenario 1: Default READ COMMITTED Isolation Level**
+
+In this mode, each statement gets a fresh snapshot of the database at the moment it runs.
+
+* **Initial State:** A product row exists: (product\_id: 123, stock\_count: 10).  
+* **11:00 AM:** TxA runs UPDATE products SET stock\_count \= stock\_count \- 1 .... It acquires an **exclusive row-level lock**. A new potential version of the row with stock\_count \= 9 is created.  
+* **11:01 AM:** TxB runs the same UPDATE query. It attempts to acquire a lock on the same row but is **blocked** by TxA. TxB waits.  
+* **11:02 AM:** TxA COMMITs. The lock is released, and the row version with stock\_count \= 9 is now official.  
+* **11:02 AM (Immediately after):** TxB is unblocked. It **re-evaluates its query against the new database state**. It now sees the row with stock\_count \= 9 and applies its own update on top of it.  
+* **Outcome:** TxB commits, and the final state is stock\_count \= 8\. The updates are applied sequentially, ensuring correctness.
+
+##### **Scenario 2: Stricter REPEATABLE READ or SERIALIZABLE Isolation Levels**
+
+In these modes, a transaction operates on a single, consistent snapshot taken at the very beginning of the transaction.
+
+* **Initial State:** (product\_id: 123, stock\_count: 10).  
+* **11:00 AM:** TxA starts.  
+* **11:01 AM:** TxB starts (in REPEATABLE READ mode). It takes a snapshot where stock\_count is 10\.  
+* **11:02 AM:** TxA runs its UPDATE and COMMITs. The database now officially has the row with stock\_count \= 9\.  
+* **11:03 AM:** TxB runs its UPDATE query. It is briefly blocked. When unblocked, PostgreSQL detects a conflict: the current state of the row (stock\_count \= 9\) is different from what existed in TxB's initial snapshot (stock\_count \= 10).  
+
+* **Outcome:** **TxB fails and is rolled back.** PostgreSQL returns a **serialization failure error** (ERROR: could not serialize access due to concurrent update). To prevent a "lost update" anomaly, the application is responsible for catching this error and retrying Transaction B. 
 * **Outcome:** Pessimistic locking ensures correctness when multiple writers compete for the same row. This prevents "lost updates" and maintains serializable update behavior.
 
 ### **MVCC and Vacuum: Preventing Bloat**
