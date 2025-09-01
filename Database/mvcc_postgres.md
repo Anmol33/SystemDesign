@@ -15,7 +15,7 @@ Before diving into the steps, let's define some core PostgreSQL-specific concept
   1. T.xmin is **COMMITTED** AND (T.xmin is less than TxN's snapshot\_xmin OR T.xmin is TxN's *own XID*).  
   2. AND (T.xmax is 0/infinity OR T.xmax is ABORTED OR T.xmax is greater than or equal to TxN's snapshot\_xmin).  
 * **Transaction Snapshot (xmin, xmax, active\_xids):** When a transaction starts, it takes a "snapshot" of the currently active (running) transactions. This snapshot defines:  
-  * snapshot\_xmin: The lowest XID that was active when the snapshot was taken. Any transaction with an XID less than snapshot\_xmin is considered either committed or aborted.  
+  * snapshot\_xmin: The lowest XID that was active when the snapshot was taken( these are active transactions not yet committed ). Any transaction with an XID less than snapshot\_xmin is considered either committed or aborted.  
   * snapshot\_xmax: The highest XID that was active when the snapshot was taken.  
   * active\_xids: A list of XIDs that were active when the snapshot was taken, but are between snapshot\_xmin and snapshot\_xmax.  
     A transaction will:  
