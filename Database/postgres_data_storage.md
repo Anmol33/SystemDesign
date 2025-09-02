@@ -13,6 +13,7 @@ A directory is a special file that acts as a simple table. Its only job is to ma
 | :--- | :--- |  
 | report.pdf | \#86753 |  
 | notes.txt | \#91210 |  
+
 2\. The Inode: The File's Metadata  
 The inode is the metadata headquarters for a file. It stores everything about the file except its name. When you access a file, the system looks up the filename in the directory to get the inode number, then reads the inode to get all the other details.  
 Inode \#86753:
@@ -101,6 +102,7 @@ Initial State on Page \#50:
 | ctid | xmin | xmax | Data |  
 | :--- | :--- | :--- | :--- |  
 | (50,1) | 801 | 0 | (101, 'Anjali') |  
+
 Transaction XID 905 runs: UPDATE employees SET name \= 'Anjali Sharma' WHERE employee\_id \= 101;
 
 New State on Page \#50:  
@@ -108,6 +110,7 @@ New State on Page \#50:
 | :--- | :--- | :--- | :--- |  
 | (50,1) | 801 | 905 | (101, 'Anjali') |  
 | (50,2) | 905 | 0 | (101, 'Anjali Sharma') |  
+
 An old transaction still sees the first row. A new transaction starting after XID 905 commits will only see the second row.
 
 ### **Chapter 6: The Safety Net \- Surviving a Crash with the WAL**
