@@ -1,4 +1,4 @@
-## **PostgreSQL MVCC: A Deep Dive into Transaction Management**
+# **PostgreSQL MVCC: A Deep Dive into Transaction Management**
 
 Multi-Version Concurrency Control (MVCC) is a fundamental mechanism in PostgreSQL that allows multiple transactions to access and modify the database concurrently without interfering with each other. Unlike traditional locking mechanisms where readers might block writers (and vice-versa), MVCC provides each transaction with its own "snapshot" of the database, ensuring consistent reads and high concurrency.
 
@@ -6,278 +6,124 @@ Multi-Version Concurrency Control (MVCC) is a fundamental mechanism in PostgreSQ
 
 Before diving into the steps, let's define some core PostgreSQL-specific concepts:
 
-* **Transaction ID (XID):** Every transaction in PostgreSQL is assigned a unique, monotonically increasing 32-bit (or 64-bit for internal use) Transaction ID. This XID is crucial for determining the visibility of data versions.  
+* **Transaction ID (XID):** Every transaction in PostgreSQL is assigned a unique, monotonically increasing 32-bit Transaction ID. This XID is crucial for determining the visibility of data versions.  
 * **Tuple (Row Version):** In PostgreSQL, when a row is modified, a **new version** of that row (called a "tuple") is created. The old version is not immediately deleted but marked as obsolete.  
 * **Tuple Metadata:** Each tuple carries hidden system columns that define its visibility:  
-  * xmin: The XID of the transaction that **inserted** this tuple.  
-  * xmax: The XID of the transaction that **deleted or updated** this tuple. If the tuple is still valid and not deleted/updated, xmax is typically 0 or a special "infinity" value.  
-* **Visibility Rules:** A transaction TxN can see a tuple T if:  
-  1. T.xmin is **COMMITTED** AND (T.xmin is less than TxN's snapshot\_xmin OR T.xmin is TxN's *own XID*).  
-  2. AND (T.xmax is 0/infinity OR T.xmax is ABORTED OR T.xmax is greater than or equal to TxN's snapshot\_xmin).  
-* **Transaction Snapshot (xmin, xmax, active\_xids):** When a transaction starts, it takes a "snapshot" of the currently active (running) transactions. This snapshot defines:  
-  * snapshot\_xmin: The lowest XID that was active when the snapshot was taken( these are active transactions not yet committed ). Any transaction with an XID less than snapshot\_xmin is considered either committed or aborted.  
-  * snapshot\_xmax: The highest XID that was active when the snapshot was taken.  
-  * active\_xids: A list of XIDs that were active when the snapshot was taken, but are between snapshot\_xmin and snapshot\_xmax.  
-    A transaction will:  
-  * See tuples whose xmin is **committed** and less than snapshot\_xmin (meaning they were created by transactions that committed before its snapshot started), OR whose xmin is *its own XID* (allowing it to see its own writes).  
-  * Ignore tuples whose xmax is in active\_xids (meaning they were logically deleted by other transactions still running) or whose xmax is **committed** and less than snapshot\_xmin (meaning they were logically deleted by a transaction that committed before its snapshot started).  
-* **Write-Ahead Log (WAL):** A sequential, append-only log of all changes made to the database. All modifications (including data changes and commit/abort records) are first written to the WAL and flushed to disk *before* the changes are applied to data files.  
-* **Global Transaction Status:** PostgreSQL maintains an internal structure (partially in memory and partially on disk) that tracks the commit/abort status of recent XIDs. This is critical for visibility decisions.
+  * **xmin:** The XID of the transaction that **inserted** this tuple.  
+  * **xmax:** The XID of the transaction that **deleted or updated** this tuple. If the tuple is live, xmax is 0\.  
+* **Transaction Snapshot:** When a transaction starts, it takes a "snapshot" of the database's state. This is not a copy of the data, but a set of rules that defines what it is allowed to see.  
+  * **snapshot\_xmin:** The lowest XID that was active ("in-progress") when the snapshot was taken. Any XID lower than this is guaranteed to be finished (committed or aborted).  
+  * **snapshot\_xmax:** The highest XID that was active when the snapshot was taken.  
+  * **active\_xids:** A list of all XIDs that were "in-progress" when the snapshot was taken.  
+* **The Golden Rules of Visibility:** For a row version to be **VISIBLE**, it must satisfy **BOTH** of these rules:  
+  1. The transaction that created it (xmin) **must be visible** to you (committed and considered in the past).  
+  2. The transaction that deleted it (xmax), if any, **must NOT be visible** to you (aborted, or was still in-progress when your snapshot was taken).
+
+#### **Visibility Decision Matrix**
+
+| Scenario \# | Tuple State on Disk | The Rule | Is it Visible? | Reasoning |
+| :---- | :---- | :---- | :---- | :---- |
+| 1 | xmin is old & committed.\<br\>xmax is 0\. | **The Standard Visible Row** | ✅ **Yes** | The creator (xmin) is in the past, and it has not been deleted. |
+| 2 | xmin is old & committed.\<br\>xmax is old & committed. | **The Standard Deleted Row** | ❌ **No** | The creator is in the past, but the deleter (xmax) is *also* in the past. The deletion is a historical fact. |
+| 3 | xmin is your own XID.\<br\>xmax is 0\. | **A Row You Just Inserted** | ✅ **Yes** | A transaction can always see its own writes. |
+| 4 | xmin is old & committed.\<br\>xmax is your own XID. | **A Row You Just Deleted** | ❌ **No** | A transaction should not see rows it has just deleted. |
+| 5 | xmin is in active\_xids.\<br\>xmax is 0\. | **Created by an In-Progress Txn** | ❌ **No** | The creator's outcome is unknown. To be safe, the database assumes it might ROLLBACK. The creation hasn't "happened yet" for you. |
+| 6 | xmin is old & committed.\<br\>xmax is in active\_xids. | **Deleted by an In-Progress Txn** | ✅ **Yes** | The deleter's outcome is unknown. The database assumes it might ROLLBACK. The deletion hasn't "happened yet" for you, so you must see the row. |
+| 7 | xmin is from an aborted txn.\<br\>xmax is 0\. | **Created by an Aborted Txn** | ❌ **No** | The creating transaction never officially happened. The row is phantom data. |
+| 8 | xmin is old & committed.\<br\>xmax is from an aborted txn. | **Deleted by an Aborted Txn** | ✅ **Yes** | The deleting transaction never officially happened, so the deletion is invalid. |
+
+* **Write-Ahead Log (WAL):** A sequential, append-only log of all changes. All modifications are first written to the WAL and flushed to disk *before* the changes are applied to the main data files, guaranteeing durability.  
+* **Global Transaction Status (clog):** PostgreSQL maintains an internal structure (the Commit Log) that tracks the commit/abort status of recent XIDs. This is critical for visibility decisions.
+
+### **PostgreSQL and ACID Compliance**
+
+The mechanisms described in this document are how PostgreSQL guarantees ACID properties, the gold standard for relational databases.
+
+* **Atomicity:** An entire transaction is treated as a single, indivisible unit. It either succeeds completely or fails entirely. This is achieved via the WAL. A special "commit record" is the final entry for a transaction in the log. If a crash occurs before that record is written, the entire transaction is rolled back during recovery.  
+* **Consistency:** A transaction brings the database from one valid state to another. PostgreSQL enforces this through constraints (e.g., PRIMARY KEY, FOREIGN KEY, CHECK constraints). While MVCC provides a consistent *view*, it is the constraint system that ensures the *state* of the data is always valid.  
+* **Isolation:** Concurrent transactions should not interfere with each other. This is the primary role of MVCC. By providing each transaction with a distinct snapshot of the data, PostgreSQL ensures that the operations of one transaction are isolated from others, as detailed in the scenario matrix below.  
+* **Durability:** Once a transaction has been committed, it will remain so, even in the event of a power loss or crash. This is guaranteed by the Write-Ahead Log. Before the database reports "commit successful" to the client, the WAL records (including the commit record) are flushed to permanent storage (fsync).
 
 ### **Detailed Transaction Flow (Example: UPDATE)**
 
-Let's trace an UPDATE operation for a row in a table products (id, name, price).  
-Initial state: id=1, name='Laptop', price=1000 (let's say xmin=100, xmax=0).  
-**Transaction TxN (XID 200\) wants to update price to 1050\.**
+Let's trace an UPDATE operation for a row in a table products.  
+Initial state: id=1, name='Laptop', price=1000 (created by XID 100).  
+Transaction TxN (assigned XID 200\) wants to update price to 1050\.
 
 #### **Step 1: Start Transaction & Snapshot**
 
-* **Action:** Client sends BEGIN or implicitly starts a transaction with a DML statement.  
-* **Atomic Operation:**  
-  * PostgreSQL assigns a unique **XID (e.g., 200\)** to TxN.  
-  * It captures a **snapshot** of the current system state, including snapshot\_xmin, snapshot\_xmax, and active\_xids. This snapshot defines what data TxN will see throughout its lifetime.  
-* **Failure Scenario (Crash before XID assignment):** If a crash occurs here, the transaction effectively never started. No changes are made, and no recovery is needed for this transaction.  
+* **Action:** Client sends BEGIN.  
+* **Atomic Operation:** PostgreSQL assigns a unique **XID (200)** and captures a **snapshot** of the system state. This snapshot is constant for the duration of the transaction (in REPEATABLE READ or SERIALIZABLE modes).  
+* **Failure Scenario (Crash before XID assignment):** If a crash occurs here, the transaction effectively never started. No changes are made, and no recovery is needed.  
 * **Concurrent Handling:** Other transactions are unaffected. They continue with their own snapshots.
 
 #### **Step 2: Data Modification (Row Update & Locking)**
 
 * **Action:** TxN executes UPDATE products SET price \= 1050 WHERE id \= 1;  
 * **Atomic Operations:**  
-  * **Acquire Lock:** TxN acquires an **exclusive row-level lock** on the tuple (id=1, name='Laptop', price=1000). This prevents other *writers* from concurrently modifying the *same logical row*.  
-  * **Create New Tuple:** A **new tuple** is created in memory: (id=1, name='Laptop', price=1050). Its metadata is set: xmin=200, xmax=0.  
-  * **Mark Old Tuple Obsolete:** The *old tuple* (id=1, name='Laptop', price=1000) is updated in memory. Its xmax is set to 200 (the XID of the transaction that superseded it).  
-  * **Dirty Page:** The memory page containing these tuples is now marked "dirty" (modified).  
-* **Failure Scenario (Crash after tuple update, before WAL write):** The in-memory changes (new tuple, old tuple marked obsolete) are lost. Since nothing was written to WAL, no recovery is needed for this transaction. The database state reverts to the last committed state.  
+  * **Acquire Lock:** TxN acquires an **exclusive row-level lock** on the row with id=1. This prevents other *writers* from concurrently modifying this specific row.  
+  * **Create New Tuple:** A new tuple (id=1, name='Laptop', price=1050) is created in memory. Its metadata is set: xmin=200, xmax=0.  
+  * **Mark Old Tuple Obsolete:** The old tuple's xmax is set to 200\. The page is now "dirty".  
+* **Failure Scenario (Crash after tuple update, before WAL write):** The in-memory changes are lost. Since nothing was written to WAL, the database state reverts to the last committed state upon restart.  
 * **Concurrent Handling:**  
-  * **Concurrent Readers:** Other reading transactions (with snapshots taken *before* TxN commits) will *still see the old tuple* (id=1, name='Laptop', price=1000) because its xmax (200) is not yet a committed XID. They are not blocked by TxN's write.  
-  * **Concurrent Writers:** Another transaction trying to UPDATE or DELETE the *same* row id=1 would be **blocked** by TxN's exclusive row-level lock until TxN commits or aborts. This is how write-write conflicts are handled in PostgreSQL – by blocking.
+  * **Readers:** Other transactions with older snapshots still see the old tuple because its xmax (200) is not yet committed. They are not blocked.  
+  * **Writers:** Another transaction trying to UPDATE the *same* row will be **blocked** by the row-level lock.
 
 #### **Step 3: WAL Write (Durability Point)**
 
-* **Action:** TxN prepares to commit, or its in-memory WAL buffer fills.  
-* **Atomic Operations:**  
-  * A **WAL record** is generated describing the insertion of the new tuple (xmin=200) and the update to the old tuple (xmax=200).  
-  * This WAL record is appended to the in-memory WAL buffer.  
-  * The WAL buffer is then **flushed to the WAL Disk File** using a synchronization call (fsync). This ensures the changes are physically on non-volatile storage.  
-* **Failure Scenario (Crash after WAL flush but before commit):** The WAL record for TxN's data changes is durable. However, the transaction's commit status is *not yet durable*. During recovery, the system will find TxN's data changes in the WAL but will see that TxN was not marked COMMITTED in the global transaction status (which is also recovered from WAL/checkpoints). Therefore, TxN's changes will **not be applied** (they are ignored during replay). The client would not have received an ACK.  
-* **Concurrent Handling:** This step is internal and does not directly affect other concurrent transactions' visibility or blocking.
+* **Action:** TxN prepares to commit.  
+* **Atomic Operations:** A **WAL record** describing the data changes is written and **flushed (fsync) to disk**. This makes the *data change* durable, but not the transaction itself.  
+* **Failure Scenario (Crash after WAL flush but before commit):** The WAL record for the data change is durable. However, during recovery, the system will see that XID 200 was not marked as committed. Therefore, its changes will be ignored during replay.
 
 #### **Step 4: Commit & Acknowledge (Visibility Point)**
 
 * **Action:** TxN sends COMMIT;  
 * **Atomic Operations:**  
-  * A **special "commit record"** is generated for TxN (XID 200).  
-  * This commit record is appended to the WAL and **flushed to the WAL Disk File** (often as part of the same fsync or immediately after the data change WAL records). **This makes the transaction's commitment durable.**  
-  * The In-Memory Global Transaction Status Map is **atomically updated** to mark XID 200 as COMMITTED. This is the point where the changes become globally visible according to MVCC rules.  
-  * TxN's row-level lock on id=1 is **released**.  
-* **Failure Scenario (Crash after commit record flush, before ACK):** The transaction is fully durable and committed. During recovery, the system will find the COMMITTED record for TxN in the WAL and will replay its changes. The database will be consistent. The client, however, would not receive an ACK and would experience a timeout/error, requiring application-level retry or status check.  
-* **Concurrent Handling:**  
-  * **Concurrent Readers:** Any new reading transactions, or existing ones that are configured to refresh their snapshot, will now see the new tuple (id=1, name='Laptop', price=1050) because TxN (XID 200\) is now COMMITTED.  
-  * **Concurrent Writers:** The row-level lock on id=1 is released, allowing any previously blocked writers to proceed.
+  * A special **"commit record"** for XID 200 is written and **flushed to the WAL Disk File**. This is the point of no return; the transaction is now officially and durably committed.  
+  * The in-memory transaction status map is updated to mark XID 200 as COMMITTED. This makes the changes globally visible.  
+  * TxN's **row-level lock is released**.  
+* **Failure Scenario (Crash after commit record flush, before ACK):** The transaction is fully durable. The client would not receive an ACK, but upon recovery, the database state will correctly reflect the committed changes.
 
 #### **Step 5: Acknowledge Commit**
 
 * **Action:** The database sends a "Commit OK" message to the client.
 
-### **Concurrent Transaction Handling Examples**
+### **Concurrent Transaction Handling: The Scenario Matrix**
 
-# **PostgreSQL Concurrency Handling with MVCC**
-
-### **Concurrent Transaction Handling Examples**
-
-#### **Read-Read Concurrency**
-
-* **Scenario:** Transaction A (TxA) reads Row R. Concurrently, Transaction B (TxB) reads Row R.  
-* **MVCC Handling:** Both TxA and TxB begin and take their own unique "snapshots" of the database state. Since no transaction is writing or modifying the row, both see the same committed version of Row R as it existed when their snapshots were taken. No locks are required because no modification occurs.  
-* **Outcome:** High performance with no contention or blocking. Both transactions get a consistent view of the data.
-
-#### **Read-Write Concurrency**
-
-* **Scenario:** TxA reads Row R while TxB concurrently updates it.  
-* **MVCC Handling:**  
-  * TxA starts and takes its snapshot of the database. It reads the original version of Row R.  
-  * TxB starts (concurrently or later), updates Row R, and creates a new version of the row tuple. It marks the old tuple as "deleted" for future transactions by setting its xmax.  
-  * Because TxA is operating on its older snapshot, it continues to see the original version of Row R and is **not blocked** by TxB's write lock.  
-  * After TxB commits, new transactions that start will see the new, updated version of Row R.  
-* **Outcome:** Snapshot isolation is maintained. **Readers do not block writers, and writers do not block readers.** This prevents "dirty reads" and is a core performance feature of MVCC.
-
-#### **Write-Write Concurrency**
-
-* **Scenario:** TxA and TxB both attempt to update the same Row R.  
-* **MVCC Handling:** The outcome is determined by the **Transaction Isolation Level**.
-
-##### **Scenario 1: Default READ COMMITTED Isolation Level**
-
-In this mode, each statement gets a fresh snapshot of the database at the moment it runs.
-
-* **Initial State:** A product row exists: (product\_id: 123, stock\_count: 10).  
-* **11:00 AM:** TxA runs UPDATE products SET stock\_count \= stock\_count \- 1 .... It acquires an **exclusive row-level lock**. A new potential version of the row with stock\_count \= 9 is created.  
-* **11:01 AM:** TxB runs the same UPDATE query. It attempts to acquire a lock on the same row but is **blocked** by TxA. TxB waits.  
-* **11:02 AM:** TxA COMMITs. The lock is released, and the row version with stock\_count \= 9 is now official.  
-* **11:02 AM (Immediately after):** TxB is unblocked. It **re-evaluates its query against the new database state**. It now sees the row with stock\_count \= 9 and applies its own update on top of it.  
-* **Outcome:** TxB commits, and the final state is stock\_count \= 8\. The updates are applied sequentially, ensuring correctness.
-
-##### **Scenario 2: Stricter REPEATABLE READ or SERIALIZABLE Isolation Levels**
-
-In these modes, a transaction operates on a single, consistent snapshot taken at the very beginning of the transaction.
-
-* **Initial State:** (product\_id: 123, stock\_count: 10).  
-* **11:00 AM:** TxA starts.  
-* **11:01 AM:** TxB starts (in REPEATABLE READ mode). It takes a snapshot where stock\_count is 10\.  
-* **11:02 AM:** TxA runs its UPDATE and COMMITs. The database now officially has the row with stock\_count \= 9\.  
-* **11:03 AM:** TxB runs its UPDATE query. It is briefly blocked. When unblocked, PostgreSQL detects a conflict: the current state of the row (stock\_count \= 9\) is different from what existed in TxB's initial snapshot (stock\_count \= 10).  
-
-* **Outcome:** **TxB fails and is rolled back.** PostgreSQL returns a **serialization failure error** (ERROR: could not serialize access due to concurrent update). To prevent a "lost update" anomaly, the application is responsible for catching this error and retrying Transaction B. 
-* **Outcome:** Pessimistic locking ensures correctness when multiple writers compete for the same row. This prevents "lost updates" and maintains serializable update behavior.
+| Scenario | Isolation Level | Mechanism | Behavior & Interaction | Outcome |
+| :---- | :---- | :---- | :---- | :---- |
+| **Read vs. Read** | Any | Pure MVCC | TxA gets its snapshot. TxB gets its own snapshot. Neither transaction modifies data. | **No blocking.** Both transactions see the same committed data based on their respective snapshots and complete in parallel. |
+| **Read vs. Write** | Any | Pure MVCC | TxA (reader) starts with a snapshot. TxB (writer) starts, acquires a row-lock, creates a new row version, and commits. TxA's snapshot is older, so it continues to read the *old* version of the row, completely ignoring TxB's changes. | **No blocking.** The fundamental "readers don't block writers, and writers don't block readers" principle. TxA gets a consistent view, and TxB completes its work. |
+| **Write vs. Write (Different Rows)** | Any | Row-Level Locking | TxA locks and updates Row R1. TxB locks and updates Row R2. The locks do not conflict. | **No blocking.** Both transactions modify different data and can be committed in parallel. |
+| **Write vs. Write (Same Row)** | **READ COMMITTED** (Default) | Row-Level Locking | 1\. TxA locks and updates Row R.\<br\>2. TxB attempts to update Row R and is **blocked** by TxA's lock.\<br\>3. TxA commits, releasing the lock.\<br\>4. TxB is unblocked, gets a *new snapshot*, sees TxA's changes, and applies its update on top of the newly committed data. | **Blocking occurs, but the update succeeds.** The second transaction effectively waits and then reapplies its logic on the newer version of the row. Updates are serialized correctly. |
+| **Write vs. Write (Same Row)** | **REPEATABLE READ** or **SERIALIZABLE** | MVCC Snapshot Validation \+ Locking | 1\. TxA and TxB both start and get a consistent snapshot where Row R has a specific state.\<br\>2. TxA locks, updates, and commits Row R.\<br\>3. TxB attempts its update. It is briefly blocked. When unblocked, PostgreSQL detects that the current state of Row R has changed since TxB's snapshot was taken. | **Serialization Failure.** To prevent a "lost update," TxB is automatically **rolled back** with a serialization failure error. The application must catch this error and retry the transaction. |
 
 ### **MVCC and Vacuum: Preventing Bloat**
 
 Since PostgreSQL does not immediately delete old tuple versions, these obsolete rows accumulate over time, leading to table bloat. To manage this, PostgreSQL relies on a background process called **vacuum**.
 
 * **What Vacuum Does:**  
-  * Identifies **dead tuples** (i.e., no longer visible to any current or future transaction).  
+  * Identifies **dead tuples** (no longer visible to any current or future transaction).  
   * **Reclaims space** occupied by dead tuples for reuse.  
   * Updates visibility maps to speed up index-only scans.  
-  * Advances the relfrozenxid, preventing transaction ID wraparound.  
-* **Types of Vacuum:**  
-  * **Autovacuum:** Runs automatically based on table activity thresholds. It's lightweight and safe for most workloads, helping maintain database health with minimal manual intervention.  
-  * **Manual Vacuum (VACUUM / VACUUM FULL):**  
-    * VACUUM: Non-blocking, reclaims space, updates statistics.  
-    * VACUUM FULL: Requires an exclusive lock, compacts the table by rewriting it entirely, useful for significant space reclamation.  
-* **Importance of Vacuum for MVCC:**  
-  * Vacuum ensures that dead tuples from old transactions are cleaned up.  
-  * Storage remains efficient.  
-  * Performance doesn’t degrade due to large numbers of invisible rows.  
-  * Without vacuum, MVCC would lead to unbounded growth in storage usage and degrade performance over time.
- 
-# Understanding PostgreSQL's Transaction ID Wraparound Problem
+  * Performs the anti-wraparound freezing described in the next section.  
+* **Importance of Vacuum for MVCC:** Without vacuum, MVCC would lead to unbounded growth in storage usage and degrade performance over time. It is the janitorial process that makes the entire versioning system viable long-term.
 
-## Key Metadata Fields in PostgreSQL
-Every row (or **tuple**) in a PostgreSQL table stores two important metadata fields:
+### **Understanding PostgreSQL's Transaction ID Wraparound Problem**
 
-- **xmin**: The transaction ID (XID) that created this version of the row.  
-- **xmax**: The transaction ID that deleted this version of the row.  
-  - If this value is `0`, the row version is currently **live** and has not been deleted.
+The transaction ID is a 32-bit integer, meaning it "wraps around" after \~4.2 billion transactions. This poses a catastrophic risk.
 
----
+* **The Problem:** After wraparound, a new transaction with XID 100 would see an old, stable row with XID 3,000,000,000 as being "in the future" (3B \> 100), making the old data suddenly invisible and causing silent data loss.  
+* **The Solution (VACUUM):** The VACUUM process is essential for preventing this. It scans tables and finds rows with very old xmin values. It then replaces these old XIDs with a special, permanent XID 2 (known as FrozenTransactionId). This special XID is *always* considered to be in the past, regardless of wraparound. Regular autovacuum is critical for database health.
 
-## The Database Visibility Rule
-PostgreSQL decides if your current transaction can "see" a row using **visibility checks**:
+**Worked Example:**
 
-For a transaction with `current_xid`, a row is visible if:
-
-1. The row's `xmin` is **older than** `current_xid`.  
-2. The row's `xmax` is:
-   - `0` (row not deleted), OR  
-   - From a transaction that is in the **future** relative to yours.
-
-This creates a **linear timeline**, where:
-- Smaller XID numbers = past  
-- Larger XID numbers = future  
-
----
-
-## Example: Before Wraparound
-Imagine a simple **products** table.  
-
-- Current transaction ID ≈ `3,000,000,000`.  
-- Query:  
-  ```sql
-  SELECT * FROM products;
-
-# PostgreSQL Wraparound: Worked Example in Markdown
-
-## Rows on disk (before wraparound)
-
-| product_id | product_name | xmin          | xmax |
-|------------|--------------|---------------|------|
-| 1          | Laptop       | 1,500,000,000 | 0    |
-| 2          | Mouse        | 2,500,000,000 | 0    |
-
-**Visibility check (current_xid ≈ 3,000,000,000):**
-- Laptop: `1.5B < 3B` ✅ and `xmax = 0` ✅ → **Visible**
-- Mouse: `2.5B < 3B` ✅ and `xmax = 0` ✅ → **Visible**
-
-✅ Both rows are returned correctly.
-
----
-
-## The Wraparound Problem
-
-- PostgreSQL transaction IDs are **32-bit** and max out around **4.2 billion**.
-- Last committed transaction: `XID = 4,200,000,000`.
-- Counter wraps → new transaction gets: `current_xid = 100`.
-
-**Query again:**
-```sql
-SELECT * FROM products;
-```
-
-## Rows on Disk (Unchanged)
-
-| product_id | product_name | xmin          | xmax |
-|------------|--------------|---------------|------|
-| 1          | Laptop       | 1,500,000,000 | 0    |
-| 2          | Mouse        | 2,500,000,000 | 0    |
-
----
-
-## Visibility Check After Wraparound (`current_xid = 100`)
-
-- Laptop: `1.5B < 100` ❌ → **Invisible**  
-- Mouse: `2.5B < 100` ❌ → **Invisible**
-
-⚠️ Both rows become **invisible**.  
-The data is still on disk but **logically inaccessible** → silent data loss.
-
----
-
-## How VACUUM and `relfrozenxid` Prevent Wraparound
-
-- Each table has a **`relfrozenxid`** = oldest XID not yet frozen.  
-- Example: `relfrozenxid = 1,000,000,000`.
-
-**What VACUUM does:**
-1. Scans the table.  
-2. Finds rows where `xmin < relfrozenxid`.  
-3. Replaces `xmin` with **`FrozenTransactionId (2)`** (always considered in the past).  
-4. Advances `relfrozenxid` to a newer, safe value.  
-
----
-
-## Example After VACUUM
-
-**Rows updated by VACUUM:**
-
-| product_id | product_name | xmin | xmax |
-|------------|--------------|------|------|
-| 1          | Laptop       | 2    | 0    |
-| 2          | Mouse        | 2    | 0    |
-
-➡️ `relfrozenxid` advanced to ~`3,500,000,000`.
-
----
-
-## Visibility After Wraparound
-
-Even if `current_xid = 100`:
-
-- Laptop: `xmin = 2 < 100` ✅ → **Visible**  
-- Mouse: `xmin = 2 < 100` ✅ → **Visible**
-
-✅ Data remains safe and visible.
-
----
-
-## Key Takeaways
-
-- PostgreSQL transaction IDs wrap around at ~**4.2B**.  
-- Without maintenance, old rows can **vanish logically** (wraparound bug).  
-- **VACUUM** prevents this by freezing rows and moving the **`relfrozenxid` horizon**.  
-- Regular **VACUUM/autovacuum** is critical to avoid catastrophic data loss.  
-
-
+* **Initial State:** A row exists with xmin \= 1,500,000,000. A transaction with current\_xid \= 3,000,000,000 can see it because 1.5B \< 3B.  
+* **Wraparound Occurs:** A new transaction gets current\_xid \= 100\.  
+* **Visibility Check Fails:** Now 1.5B \< 100 is false. The row becomes invisible.  
+* **After VACUUM:** The row's xmin is changed to 2 (Frozen).  
+* **Visibility Check Succeeds:** Now 2 \< 100 is true. The row is visible again.
 
 ### **Conclusion**
 
-PostgreSQL’s MVCC implementation combines tuple versioning, transaction snapshots, WAL, and row-level locks to ensure high concurrency, durability, and consistency. Readers never block writers, and write-write conflicts are handled via row-level locks. The design ensures that even in case of system failure, the database remains consistent and correct through careful use of WAL and transaction visibility rules.
+PostgreSQL’s MVCC implementation combines tuple versioning, transaction snapshots, WAL, and row-level locks to ensure high concurrency, durability, and consistency. Readers never block writers, and write-write conflicts are handled via row-level locks and isolation rules. The design ensures that even in case of system failure, the database remains consistent and correct through careful use of the Write-Ahead Log and transaction visibility rules.
