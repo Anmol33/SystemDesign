@@ -2,6 +2,9 @@
 
 # **The Raft Consensus Algorithm: A Guide to Understandable Distributed Consensus**
 
+## **DEMO**
+https://thesecretlivesofdata.com/raft/
+
 ## **Introduction**
 
 In the world of distributed systems, one of the most fundamental challenges is achieving **consensus**: the process of getting a group of independent computers to agree on a shared state, even in the presence of failures.1 For years, the go-to solution for this problem was the Paxos algorithm, a protocol known for its mathematical correctness but also for its notorious complexity.3 This complexity made Paxos difficult to implement and even harder to understand, creating a gap between theory and practice.
