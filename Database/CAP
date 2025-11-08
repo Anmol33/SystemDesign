@@ -1,0 +1,197 @@
+## 🧩 1. CAP Theorem Refresher (in Context)
+
+When a **network partition** happens — meaning nodes cannot talk to each other —
+you must choose between:
+
+| Property                    | Meaning                                                                    |
+| --------------------------- | -------------------------------------------------------------------------- |
+| **Consistency (C)**         | All replicas see the same data (no stale or conflicting reads).            |
+| **Availability (A)**        | Every request gets a valid response, even if some nodes can’t communicate. |
+| **Partition Tolerance (P)** | System continues to operate despite network failures.                      |
+
+So in the face of a partition:
+
+> You can be **CP (consistent + partition tolerant)** *or* **AP (available + partition tolerant)** —
+> you can’t have both.
+
+---
+
+## ⚙️ 2. System-by-System Breakdown
+
+Let’s analyze **Spanner**, **CockroachDB**, **MongoDB**, and **Redis**,
+based on how they handle **consistency**, **availability**, and **partitions**.
+
+---
+
+### 🧭 **1. Google Spanner → CP (Consistency + Partition Tolerance)**
+
+**Consensus Algorithm:** Paxos (with TrueTime)
+**Consistency:** Strong (externally consistent / serializable)
+
+✅ **Consistency:**
+
+* Every write goes through Paxos leader and gets a globally ordered timestamp.
+* Global “TrueTime” ensures commits are ordered by real-time.
+
+🛑 **Availability:**
+
+* If a region loses quorum (majority replicas), it **cannot write**.
+* Read-only transactions might still work in some cases, but **writes are blocked**.
+
+**Example:**
+
+* 5 replicas, quorum = 3
+* If only 2 replicas reachable → can’t commit → cluster halts writes.
+
+👉 **Verdict:**
+**Spanner is CP.**
+Prioritizes global correctness over availability during network partitions.
+
+---
+
+### ⚙️ **2. CockroachDB → CP**
+
+**Consensus Algorithm:** Raft
+**Consistency:** Serializable transactions (via Raft per range)
+
+✅ **Consistency:**
+
+* Each data “range” uses Raft consensus → strong consistency per range.
+* Transactions span multiple ranges with two-phase commit.
+
+🛑 **Availability:**
+
+* If quorum for a range is lost → that range becomes **unavailable for writes**.
+* Reads can still happen (depending on read consistency level).
+
+**Example:**
+
+* 3 replicas per range → need 2 for quorum.
+* If 2 down → no writes for that range.
+
+👉 **Verdict:**
+**CockroachDB is CP** — consistent but can become unavailable for part of data.
+
+---
+
+### 🍃 **3. MongoDB → Tunable (CP by default)**
+
+**Consensus Algorithm:** Raft (since version 5+; before that, custom protocol)
+**Architecture:** Primary–Secondary Replication
+
+✅ **Consistency (default):**
+
+* Writes go only to the **primary**.
+* Reads from secondaries are *eventually consistent* unless you use “read from primary only”.
+
+🛑 **Availability:**
+
+* If the primary is lost, the cluster elects a new one (needs majority).
+* During election (a few seconds), **writes are blocked**.
+* If majority of nodes are unreachable → **no writes allowed**.
+
+**Example:**
+
+* 3-node replica set → 2 needed for quorum.
+* If partition leaves only 1 node → cluster is **read-only or offline**.
+
+👉 **Verdict:**
+**MongoDB is CP under partition** — ensures consistent writes but sacrifices temporary availability during leader loss.
+
+However, you can configure **readPreference=secondary** for higher availability →
+then it becomes **AP for reads** (but eventually consistent).
+
+---
+
+### 🔴 **4. Redis (depends on mode)**
+
+Redis can behave differently depending on configuration:
+
+#### A) **Redis Standalone**
+
+* No clustering, no partition handling → not distributed → outside CAP.
+
+#### B) **Redis Sentinel (Master–Replica failover)**
+
+* Uses quorum to elect new master.
+* During election, **writes blocked** until new master elected.
+  ✅ Consistent, 🛑 Not always available.
+
+#### C) **Redis Cluster (Sharded, multi-master setup)**
+
+* Each shard has its own master + replicas.
+* If a shard master loses quorum → that shard becomes **unavailable**.
+
+👉 **Verdict:**
+**Redis Sentinel / Cluster = CP**, not AP.
+Writes block if quorum lost — to prevent split-brain.
+However, **Redis with “replica-read-only no”** can act **AP** (but risks inconsistency).
+
+---
+
+## 🧮 3. Summary Table
+
+| System                       | Consensus               | CAP Classification  | Behavior During Partition                                |
+| ---------------------------- | ----------------------- | ------------------- | -------------------------------------------------------- |
+| **Google Spanner**           | Paxos + TrueTime        | **CP**              | Writes blocked if quorum lost; consistent globally       |
+| **CockroachDB**              | Raft                    | **CP**              | Writes blocked on ranges missing quorum                  |
+| **MongoDB**                  | Raft (replica set)      | **CP (by default)** | Writes paused during election / partition                |
+| **Redis Sentinel / Cluster** | Raft-like quorum        | **CP**              | Writes blocked until leader re-elected                   |
+| **Cassandra**                | Quorum-based, no leader | **AP**              | Writes always accepted (may be inconsistent temporarily) |
+| **DynamoDB / Riak**          | Dynamo-style quorum     | **AP**              | Accepts writes on any node; resolves later               |
+
+---
+
+## 🧠 4. The Tradeoff in Simple Terms
+
+| If you choose...                            | Then...                                                        |
+| ------------------------------------------- | -------------------------------------------------------------- |
+| **CP (Consistency + Partition Tolerance)**  | You guarantee correctness but risk downtime during partitions. |
+| **AP (Availability + Partition Tolerance)** | You stay up 100% but risk serving stale or conflicting data.   |
+
+### In other words:
+
+* **Spanner / Cockroach / Mongo / Redis Cluster**
+  → “We’d rather stop than be wrong.” (CP)
+
+* **Cassandra / Dynamo / Riak**
+  → “We’d rather continue and fix later.” (AP)
+
+---
+
+## 🧩 5. Why Most Modern Databases Choose CP
+
+Because:
+
+* For *most business-critical apps*, correctness matters more than 100% uptime.
+* A short downtime (few seconds of unavailability) is safer than data corruption or lost transactions.
+* CP systems can recover deterministically.
+
+That’s why:
+
+* **etcd**, **Consul**, **Zookeeper**, **CockroachDB**, **Spanner**, **MongoDB**, and **Redis Sentinel** all use **Raft or Paxos**.
+
+---
+
+## 💡 TL;DR Summary
+
+| Database                   | CAP Type | Available During Partition?     | Why                                                |
+| -------------------------- | -------- | ------------------------------- | -------------------------------------------------- |
+| **Spanner**                | CP       | ❌ (needs quorum)                | Strong global consistency                          |
+| **CockroachDB**            | CP       | ❌ (per-range quorum needed)     | Serializable transactions                          |
+| **MongoDB**                | CP       | ❌ (during election / no quorum) | Single-leader consistency                          |
+| **Redis Sentinel/Cluster** | CP       | ❌ (failover needed)             | Prevent split-brain                                |
+| **Cassandra**              | AP       | ✅                               | Writes accepted even if partial replicas reachable |
+| **DynamoDB**               | AP       | ✅                               | Eventual consistency via quorum & versioning       |
+
+---
+
+### 🧠 In one line:
+
+> **Spanner, Cockroach, MongoDB, and Redis (Cluster/Sentinel) all prioritize *correctness* (CP), not always-on writes (AP).**
+> **Cassandra and Dynamo-like systems prioritize *availability* — they’ll take writes anytime, even at the cost of temporary inconsistency.**
+
+---
+
+Would you like me to diagram how *each system behaves during a partition* (showing leader, quorum, and which side stays writable)?
+That makes the “availability vs correctness” trade-off visually obvious.
