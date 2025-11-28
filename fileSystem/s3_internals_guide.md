@@ -733,9 +733,9 @@ S3 Standard:
 
 S3 Glacier:
 1. Receives complete 1 GB file
-2. Splits into shards (e.g., 10 pieces of ~100 MB each)
-3. Generates parity shards (6 pieces of ~100 MB each)
-4. Stores 16 shards across different servers
+2. Splits into shards (exact size is internal AWS detail)
+3. Generates parity shards
+4. Stores shards across different servers
 ```
 
 **Important:** 
@@ -958,7 +958,7 @@ S3 automatically determines optimal prefix granularity based on:
 | **Partition Server** | Manages metadata and coordinates requests for a partition |
 | **Storage Node** | Physical server storing actual object data (chunks) |
 | **Replication** | Each object stored on 3+ storage nodes across AZs |
-| **Chunking** | Large objects split into 64 MB chunks internally |
+| **Chunking** | Internal sharding for durability (size not documented) |
 | **Prefix → Partition** | Hash of prefix determines partition ID |
 | **Performance** | 3,500 writes/s, 5,500 reads/s per partition |
 | **Auto-scaling** | S3 automatically splits hot partitions |
