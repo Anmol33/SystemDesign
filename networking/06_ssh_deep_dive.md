@@ -36,7 +36,24 @@ sequenceDiagram
 
 ---
 
-## 2. Key Exchange: The "Shared Secret" (Diffie-Hellman)
+## 2. Wait, why not just use TCP?
+You asked: *"Why do we need Diffie-Hellman? Can't we just send the password over TCP?"*
+
+**TCP is just a Pipe.** It provides **Reliability** (ordering, error checking), but **Zero Secrecy**.
+*   Sending a password over raw TCP is like writing it on a **Postcard**.
+*   Every router, ISP, and hacker between you and the server can read it.
+
+**The Catch-22 of Encryption:**
+1.  To send data safely, we need to **Encrypt** it with a Key.
+2.  But the server doesn't have the Key yet.
+3.  If we send the Key over TCP, **Eve sees the Key**. Now she can decrypt everything.
+4.  We cannot send the Key without *already* having a secure tunnel.
+
+**Diffie-Hellman solves this paradox.** It allows two people to generate a secret key without *ever* sending the key itself across the wire.
+
+---
+
+## 3. Key Exchange: The "Shared Secret" (Diffie-Hellman)
 
 How do two people who have never met agree on a secret key, while everyone is listening?
 This is the **Diffie-Hellman (DH)** algorithm.
@@ -73,7 +90,7 @@ Once this "Brown" color (Session Key) is generated, the **Tunnel is active**. Al
 
 ---
 
-## 3. Public Key Authentication (`id_rsa`)
+## 4. Public Key Authentication (`id_rsa`)
 
 Why is this better than a password?
 *   **Password:** You send the secret string to the server. If the server is hacked or fake, they have your password.
@@ -90,7 +107,7 @@ Why is this better than a password?
 
 ---
 
-## 4. SSH is a Multiplexer
+## 5. SSH is a Multiplexer
 
 SSH is not just a black screen with text. It is a container for **Channels**.
 
