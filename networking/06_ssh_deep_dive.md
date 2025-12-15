@@ -36,14 +36,40 @@ sequenceDiagram
 
 ---
 
-## 2. Key Exchange: The "Shared Secret"
+## 2. Key Exchange: The "Shared Secret" (Diffie-Hellman)
 
-The most important part is Step 3 (Diffie-Hellman).
-1.  They exchange "Public variables" (colors mixed with a secret).
-2.  Through a mathematical property, they both derive the **Same Final number** (The session key).
-3.  **An eavesdropper** seeing all traffic *cannot* calculate this number.
+How do two people who have never met agree on a secret key, while everyone is listening?
+This is the **Diffie-Hellman (DH)** algorithm.
 
-Once this key is generated, the **Tunnel is active**. All subsequent traffic is encrypted with AES/ChaCha20.
+### The Analogy: Mixing Paint 🎨
+
+Imagine Alice and Bob are in a public room. Eve is watching everything.
+
+1.  **Public Color (Yellow):** They agree on a Common Color. *Eve sees Yellow.*
+2.  **Private Colors:**
+    *   Alice picks **Red** (Secret).
+    *   Bob picks **Blue** (Secret).
+    *   *Eve sees nothing.*
+3.  **The Mix:**
+    *   Alice mixes Yellow + Red = **Orange**.
+    *   Bob mixes Yellow + Blue = **Green**.
+4.  **The Exchange:**
+    *   Alice sends **Orange** to Bob. *Eve sees Orange.*
+    *   Bob sends **Green** to Alice. *Eve sees Green.*
+5.  **The Final Secret:**
+    *   Alice takes Bob's **Green** + adds her **Red** = **Brown**.
+    *   Bob takes Alice's **Orange** + adds his **Blue** = **Brown**.
+
+**Result:** Both have **Brown** (The Shared Secret).
+**Eve's Problem:** She has Yellow, Orange, and Green. She cannot make Brown without Red or Blue.
+
+### The Math Version
+It works the same way with modular arithmetic:
+*   **Paint** = Large Prime Numbers (`p`, `g`).
+*   **Mixing** = `g^private_key % p`.
+*   **Hardness** = Discrete Logarithm Problem (It's easy to mix, hard to un-mix).
+
+Once this "Brown" color (Session Key) is generated, the **Tunnel is active**. All subsequent traffic is encrypted.
 
 ---
 
