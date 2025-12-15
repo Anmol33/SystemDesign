@@ -36,20 +36,24 @@ sequenceDiagram
 
 ---
 
-## 2. Wait, why not just use TCP?
-You asked: *"Why do we need Diffie-Hellman? Can't we just send the password over TCP?"*
+## 2. Wait, why Diffie-Hellman? Why not just use TLS?
+You asked: *"Why do we need this 'Diffie-Hellman' math? Can't we just use a standard secure protocol like **TLS**?"*
 
-**TCP is just a Pipe.** It provides **Reliability** (ordering, error checking), but **Zero Secrecy**.
-*   Sending a password over raw TCP is like writing it on a **Postcard**.
-*   Every router, ISP, and hacker between you and the server can read it.
+**1. TLS *uses* Diffie-Hellman!**
+This is the key distinction:
+*   **Diffie-Hellman** is the **Algorithm** (The Math).
+*   **TLS** is the **Protocol** (The Wrapper).
 
-**The Catch-22 of Encryption:**
-1.  To send data safely, we need to **Encrypt** it with a Key.
-2.  But the server doesn't have the Key yet.
-3.  If we send the Key over TCP, **Eve sees the Key**. Now she can decrypt everything.
-4.  We cannot send the Key without *already* having a secure tunnel.
+You cannot "replace" Diffie-Hellman with TLS, because TLS *depends* on Diffie-Hellman to generate its keys (specifically `ECDHE` - Elliptic Curve Diffie-Hellman).
 
-**Diffie-Hellman solves this paradox.** It allows two people to generate a secret key without *ever* sending the key itself across the wire.
+**2. Why does SSH strictly define its own protocol?**
+*   **History:** SSH (1995) was invented before TLS (1999) became the universal standard.
+*   **Purpose:**
+    *   **TLS** is designed to verify **Servers** (Is this really google.com?).
+    *   **SSH** is designed to verify **Users** (Are you really `root`?).
+    *   SSH includes built-in Multiplexing (SFTP, Tunnels) which TLS does not have.
+
+**Summary:** Both SSH and HTTPS are cousins. They **both** use Diffie-Hellman to create the secret key.
 
 ---
 
