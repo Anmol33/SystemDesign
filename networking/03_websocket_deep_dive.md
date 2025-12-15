@@ -73,7 +73,19 @@ Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
 ```
 
 *   **101 Switching Protocols**: The specific status code that tells the client "We are no longer speaking HTTP."
-*   **Sec-WebSocket-Key/Accept**: A security challenge to prove the server genuinely understands WebSockets (and isn't just a confused echo server).
+*   **Sec-WebSocket-Accept**: The proof that the server isn't just a dumb TCP socket.
+
+### The "Magic" Algorithm (Under the Hood)
+When `websockets.serve` runs, it performs this specific RFC 6455 algorithm **automatically** for every connection:
+
+1.  **Read** the Client's `Sec-WebSocket-Key` (e.g., `dGhlIHNhbXBsZSBub25jZQ==`).
+2.  **Concatenate** it with the **Magic GUID**: `258EAFA5-E914-47DA-95CA-C5AB0DC85B11`.
+    *   *Result:* `dGhlIHNhbXBsZSBub25jZQ==258EAFA5-E914-47DA-95CA-C5AB0DC85B11`
+3.  **Hash** the result using **SHA-1**.
+4.  **Base64 Encode** the binary hash.
+5.  **Send** it back as `Sec-WebSocket-Accept`.
+
+If the Client calculates this locally and it doesn't match what the Server sent, the Client **closes the connection immediately**. This ensures the server explicitly "speaks WebSocket".
 
 ---
 
@@ -139,3 +151,79 @@ WebSockets are "Stateful" (the connection stays alive), which introduces problem
 *   Always use `wss://` (WebSocket Secure).
 *   It encrypts the traffic using TLS (SSL), just like HTTPS.
 *   Crucial because many proxies block non-encrypted WebSocket traffic on port 80.
+
+---
+
+
+---
+
+## 6. Hands-on Experiment: The Dual Protocol Server
+
+We built a real-world server (`dual_protocol_server.py`) to demonstrate how WebSockets and HTTP coexist on the same port.
+
+### The Challenge
+We wanted a single server (Port `8765`) to:
+1.  **Serve a Website** (HTTP GET) -> The Chat UI.
+2.  **Handle Chat Traffic** (WebSocket) -> The Real-time data.
+
+### The Implementation (FastAPI)
+Using `FastAPI`, we routed traffic based on the protocol:
+
+```python
+# 1. Standard HTTP Request (Browser typing path)
+@app.get("/")
+async def get():
+    return HTMLResponse(html_page)
+
+# 2. WebSocket Upgrade Request (JS: new WebSocket('wss://...'))
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept() # Send 101 Switching Protocols
+    # ... Stream data ...
+```
+
+### Observation 1: The "Not Found" Trap
+When we visited `https://localhost:8765/ws` directly in the Chrome address bar, we got a **404 Not Found**.
+
+![Browser 404 Error](assets/ws_browser_404.png)
+
+**Why?**
+*   **Browser Address Bar** = Always sends an **HTTP GET**.
+*   **Server Logic** = Expected a **WebSocket Upgrade** header on `/ws`.
+*   **Result:** Mismatch. The server correctly rejected the HTTP request.
+*   **Fix:** We added a fallback handler so if you visit `/ws` via HTTP, it says *"Please use a WebSocket client"*.
+
+### Observation 2: The Successful Handshake & Streaming
+Once we connected properly using the Javascript Client:
+1.  **Handshake:** The Network tab confirmed `101 Switching Protocols`.
+2.  **Bi-Directional Data:**
+    *   **Blue Text:** Echo messages (Request/Response).
+    *   **Red Text:** Server Events (Push).
+
+![Success Logs](assets/ws_success_events.png)
+
+**Key Takeaway:** Notice how the **Server Events** (Red) arrive independently of your user input. The server is "pushing" data (like `Server Event: Ping at 18:50:00`) instantly, without the client asking for it.
+
+---
+
+## 7. WebSocket Headers Reference
+
+The initial Handshake relies on specific HTTP headers to establish the connection.
+
+### Request Headers (Client -> Server)
+| Header | Value | Purpose |
+| :--- | :--- | :--- |
+| **`Connection`** | `Upgrade` | Tells the server this is not a normal HTTP request. |
+| **`Upgrade`** | `websocket` | Specifies the protocol we want to switch to. |
+| **`Sec-WebSocket-Key`** | `dGhlIHNhbX...` | A random 16-byte value (Base64 encoded). The server must solve a puzzle with this to prove it's a WebSocket server. |
+| **`Sec-WebSocket-Version`** | `13` | The protocol version (Standard is 13). |
+| **`Sec-WebSocket-Protocol`** | `json`, `mqtt` | (Optional) Sub-protocol negotiation. "I speak JSON, do you?" |
+| **`Sec-WebSocket-Extensions`**| `permessage-deflate` | (Optional) Requests compression (like GZIP for WS). |
+| **`Origin`** | `http://my-site.com`| Security header to prevent Cross-Site WebSocket Hijacking (CSWSH). |
+
+### Response Headers (Server -> Client)
+| Header | Value | Purpose |
+| :--- | :--- | :--- |
+| **`Status Code`** | `101 Switching Protocols` | "I accept the upgrade." |
+| **`Sec-WebSocket-Accept`** | `s3pPLMBi...` | The "Puzzle Solution". Calculated as `Base64(SHA1(Key + Magic_GUID))`. Proves the server received the handshake. |
+
