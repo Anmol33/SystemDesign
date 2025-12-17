@@ -48,6 +48,42 @@ sequenceDiagram
     Stub-->>App: Return 15
 ```
 
+### Hands-on: The Code Structure
+How does this look in practice?
+
+**1. The Contract (Method Definition)**
+First, we agree on what the function looks like.
+```protobuf
+// calculator.proto
+service Calculator {
+  rpc Add (AddRequest) returns (AddResponse);
+}
+```
+
+**2. The Client Side (The Illusion)**
+Notice how the client doesn't know *how* `Add` is implemented. It just calls the **Stub**.
+```python
+# Create a connection (Channel)
+channel = grpc.insecure_channel('localhost:50051')
+
+# Create the Stub (The Proxy Object)
+stub = calculator_pb2_grpc.CalculatorStub(channel)
+
+# Call the remote function (Looks local!)
+response = stub.Add(AddRequest(a=5, b=10))
+
+print(response.result) # Output: 15
+```
+
+**3. The Server Side (The Reality)**
+The server implements the actual logic.
+```python
+class CalculatorServicer(calculator_pb2_grpc.CalculatorServicer):
+    def Add(self, request, context):
+        # The actual work happens here
+        return AddResponse(result = request.a + request.b)
+```
+
 ### The Catch
 While the *syntax* looks local, the *reality* is different. A local function call takes nanoseconds and never fails. An RPC call takes milliseconds and can fail (Network timeout, Server down).
 
