@@ -58,6 +58,15 @@ First, we agree on what the function looks like.
 service Calculator {
   rpc Add (AddRequest) returns (AddResponse);
 }
+
+message AddRequest {
+  int32 a = 1;
+  int32 b = 2;
+}
+
+message AddResponse {
+  int32 result = 1;
+}
 ```
 
 **2. The Client Side (The Illusion)**
