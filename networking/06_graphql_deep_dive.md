@@ -94,4 +94,43 @@ For every field (`name`, `posts`), there is a function on the server that knows 
 ## 5. Challenges
 1.  **Complexity:** Setting up a GraphQL server (Schema + Resolvers) is harder than a simple REST API.
 2.  **Caching:** You can't just use standard HTTP caching (CDN/Browser) because every request is a `POST` to the same URL. You need specialized clients (Apollo, Relay).
-3.  **Security (Depth Attack):** A malicious user can write a query like `user { friends { friends { friends ... } } }` to crash your server. You need "Query Depth Limiting".
+
+---
+
+## 6. Hands-on Experiment
+
+I have created a demo server: `graphql_demo.py`.
+
+### 1. Run the Server
+```bash
+# Install dependencies (if needed)
+pip install strawberry-graphql fastapi uvicorn
+
+# Start the server
+python graphql_demo.py
+```
+
+### 2. The Playground (GraphiQL)
+Open your browser to: `http://localhost:8000/graphql`
+You will see an interactive IDE.
+
+### 3. Try this Query
+Let's see the power of fetching nested data in **one request**.
+
+```graphql
+query {
+  user(id: "1") {
+    name
+    email
+    posts {
+      title
+      author {
+        name  # Circular dependency? No problem for Graph!
+      }
+    }
+  }
+}
+```
+
+**Result:** You get a JSON with exactly this shape. No more, no less.
+
