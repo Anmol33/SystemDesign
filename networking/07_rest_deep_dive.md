@@ -90,14 +90,54 @@ Using the correct HTTP methods.
 The API tells you what you can do next.
 
 **Response:**
+
+## 5. Practical Design: The User Module
+
+Let's apply these rules to build a **User Management API**.
+
+### A. The Endpoints (Design Pattern)
+
+| Method | Endpoint | Description | Status Code |
+| :--- | :--- | :--- | :--- |
+| **GET** | `/users` | List all users | 200 OK |
+| **GET** | `/users?role=admin` | List admins (Filtering) | 200 OK |
+| **GET** | `/users/1` | Get User #1 (Detail) | 200 OK |
+| **POST** | `/users` | Create new User | **201 Created** |
+| **PUT** | `/users/1` | Replace User #1 | 200 OK |
+| **PATCH** | `/users/1` | Update User #1 (Email) | 200 OK |
+| **DELETE** | `/users/1` | Delete User #1 | **204 No Content** |
+
+### B. Understanding PUT vs PATCH
+This is a comprehensive example.
+
+**Original Resource (ID: 1):**
 ```json
-{
-  "id": 1,
-  "name": "Alice",
-  "links": [
-    { "rel": "self", "href": "/users/1" },
-    { "rel": "delete", "href": "/users/1", "method": "DELETE" }
-  ]
-}
+{ "id": 1, "name": "Alice", "email": "alice@gmail.com" }
 ```
-*   **Benefit:** The client doesn't need to hardcode URLs. It just follows links.
+
+**Scenario: Changing Email to `alice@yahoo.com`**
+
+**Option 1: using PATCH (Partial Update)**
+*   **Request:** `PATCH /users/1` with `{ "email": "alice@yahoo.com" }`
+*   **Result:** Name stays "Alice". Email updates.
+*   **Pros:** Bandwidth efficient.
+
+**Option 2: using PUT (Replacement)**
+*   **Request:** `PUT /users/1` with `{ "email": "alice@yahoo.com" }`
+*   **Result:** Name is **erased** (if you didn't send it). The resource is purely `{ "email": ... }` now.
+*   **Rule:** PUT implies "Here is the NEW complete object."
+
+### C. Hands-on Experiment
+I have created a demo server: `rest_demo.py`.
+
+1.  **Run Server:** `python rest_demo.py`
+2.  **View Docs:** Visit `http://localhost:8000/docs` (It has a Swagger UI).
+3.  **Test with Curl:**
+
+**Create a User:**
+```bash
+curl -X POST "http://localhost:8000/users" \
+     -H "Content-Type: application/json" \
+     -d '{"name": "Charlie", "email": "charlie@test.com", "role": "admin"}'
+```
+
