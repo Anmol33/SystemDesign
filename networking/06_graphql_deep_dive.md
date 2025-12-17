@@ -25,21 +25,21 @@ REST is "Resource-Based". You get what the endpoint gives you.
     4.  ...
 *   **Waste:** You made **11 network requests** for one screen. This kills mobile battery and latency.
 
-### Side Note: How gRPC solves this
-gRPC also solves the N+1 problem, but **statically**. You define a nested message structure in your `.proto` file.
+### How GraphQL Solves This
+GraphQL allows you to fetch the whole tree in **one request**. This solves the "Under-fetching" and "N+1" problem completely.
 
-```protobuf
-// gRPC sends this entire tree in ONE binary message
-message Post {
-  string title = 1;
-  User author = 2; // Nested User object
-}
-
-message FeedResponse {
-  repeated Post posts = 1; // A list of posts with their authors
+**User Action:**
+```graphql
+query {
+  posts {       # Get all posts
+    title
+    author {    # ...AND their authors
+      name
+    }
+  }
 }
 ```
-*   **Difference:** With gRPC, you *always* get the author. With GraphQL, you *choose* if you want the author.
+**Result:** 1 Request. 1 Response. 0 Battery wasted.
 
 
 ---
