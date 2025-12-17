@@ -79,15 +79,31 @@ For every field (`name`, `posts`), there is a function on the server that knows 
 
 ---
 
-## 4. REST vs GraphQL
+## 4. REST vs GraphQL: The Detailed Breakdown
+
+When should you choose one over the other?
 
 | Feature | REST | GraphQL |
 | :--- | :--- | :--- |
-| **Endpoints** | Multiple (`/users`, `/posts`) | Single (`/graphql`) |
-| **Data Fetching** | Fixed (Over/Under fetching) | Precise (Exact shape) |
-| **Versioning** | `v1`, `v2` | Deprecation of fields |
-| **Caching** | HTTP Native (Easy) | Application Level (Hard) |
-| **Error Handling** | HTTP Status Codes (404, 500) | JSON `errors` array (Always 200 OK) |
+| **Philosophy** | **Resources** (URL based) | **Graph** (Schema based) |
+| **Data Fetching** | **Fixed**. Server defines the shape. | **Flexible**. Client defines the shape. |
+| **Network Requests** | **Multiple** (N+1 problem). | **Single** (One POST request). |
+| **Versioning** | **v1, v2** (New URL for breaking changes). | **Evolution** (Deprecate fields, seamless updates). |
+| **Caching** | ✅ **Easy**. Uses HTTP Caching (Browser/CDN). | ❌ **Hard**. Requires app-level caching (Apollo/Relay). |
+| **Error Handling** | ✅ **Standard**. Uses HTTP 404, 500, 401. | ❌ **Complex**. Always returns 200 OK. Errors are in JSON body. |
+| **Development** | Frontend waits for Backend endpoint changes. | Frontend iterates independently once Schema is defined. |
+
+### When to use what?
+
+**Use REST when:**
+1.  **Simple Resources:** You have a simple blog or validatable forms.
+2.  **Caching is Critical:** You need aggressive CDN caching for public data (e.g., News site).
+3.  **Microservices:** Services talking to services often prefer gRPC or REST.
+
+**Use GraphQL when:**
+1.  **Complex Data:** You have a social network with highly nested data (Users -> Friends -> Posts -> Comments).
+2.  **Multiple Clients:** Mobile, Web, and Smartwatch all need different data shapes from the same API.
+3.  **Rapid Frontend Iteration:** You don't want to ask backend devs for a new endpoint every time you change a UI component.
 
 ---
 
