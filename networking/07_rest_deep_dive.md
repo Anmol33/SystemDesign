@@ -141,3 +141,33 @@ curl -X POST "http://localhost:8000/users" \
      -d '{"name": "Charlie", "email": "charlie@test.com", "role": "admin"}'
 ```
 
+---
+
+## 6. The 3 Golden Rules of API Design
+
+If you take nothing else from this doc, remember these rules.
+
+### Rule 1: Always use Plural Nouns
+*   ❌ **Don't:** `/user`, `/product`, `/order`
+*   ✅ **Do:** `/users`, `/products`, `/orders`
+    *   `GET /users` (Collection)
+    *   `GET /users/1` (Single Item from the Collection)
+    *   *Why?* It matches the Database table concept (`SELECT * FROM users`).
+
+### Rule 2: Precision with Status Codes
+Don't be the developer who returns `200 OK` for an error.
+*   **200 OK:** Generic success.
+*   **201 Created:** Specific to `POST`. Implies "I made a new resource".
+*   **204 No Content:** Specific to `DELETE` or `PUT`. "I did it, but have nothing to say".
+*   **400 Bad Request:** User sent garbage JSON.
+*   **401 Unauthorized:** "Who are you?" (Missing Token).
+*   **403 Forbidden:** "I know you, but you can't touch this." (Admin only).
+*   **404 Not Found:** "ID 999 doesn't exist".
+
+### Rule 3: Versioning is Mandatory
+Your API **will** change. If you don't version from Day 1, you will break mobile apps.
+*   ❌ **Bad:** `api.example.com/users`
+*   ✅ **Good:** `api.example.com/v1/users`
+    *   When you need to make a breaking change, you launch `/v2/users`.
+    *   Old apps continue working on `/v1/`.
+
