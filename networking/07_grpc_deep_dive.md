@@ -161,6 +161,41 @@ gRPC **requires** HTTP/2. It uses:
     *   External developers prefer readable JSON.
     *   Browsers handle JSON natively without extra proxies.
 
-## 5. Challenges
+
+## 5. Production Best Practices: Schema Management
+
+A common nightmare: *The Server updates the proto, but the Client is still old. Does it crash?*
+
+### A. The "Golden Rule" of Versioning
+Protobuf is designed to be **Backward & Forward Compatible**, provided you follow one rule:
+> **NEVER change the TAG NUMBER (ID) of an existing field.**
+
+*   **Scenario:**
+    *   **Old Client:** Sends `User { name=1 }`
+    *   **New Server:** Expects `User { name=1, email=2 }`
+    *   **Result:** The Server reads `name` just fine. It sees `email` is missing and uses the default value (empty string). **No Crash.**
+
+*   **Reverse Scenario:**
+    *   **New Client:** Sends `User { name=1, email=2 }`
+    *   **Old Server:** Knows `name`. It sees field `2` (email) but doesn't recognize it.
+    *   **Result:** It simply **ignores** the unknown field `2`. **No Crash.**
+
+### B. "Shared Library" Pattern
+How do you distribute these `.proto` files?
+1.  **Separate Repository:** Create a git repo just for `.proto` files (e.g., `company-protos`).
+2.  **Auto-Generation:** A CI/CD pipeline compiles them into libraries (`my-protos-python`, `my-protos-java`).
+3.  **Dependency:** Your Server and Client just install this library.
+    *   `pip install company-protos==1.2.0`
+    *   `npm install @company/protos@1.2.0`
+
+### C. Breaking Changes Detection
+Use tools like **Buf**. It runs in your CI/CD and fails the build if you:
+*   Rename a field (Breaking for JSON mapping).
+*   Change a field type (e.g., `int32` to `string`).
+*   Reuse a deleted field ID.
+
+---
+
+## 6. Challenges
 *   **Browser Support:** Browsers cannot expose raw HTTP/2 frames yet. You need a wrapper like `gRPC-Web` or a gateway (Envoy) to translate.
 *   **Debugging:** You can't just use `curl`. You need special tools like `grpcurl` to decode the binary responses.
