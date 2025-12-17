@@ -190,6 +190,44 @@ mutation {
   }
 }
 ```
-Now you can run the **Query** again, and you'll see Charlie in the list!
+
+---
+
+## 7. GraphQL Federation (Advanced)
+
+What happens when your schema becomes **too big** for one team to manage? Or when you have 50 microservices?
+
+**The Solution:** GraphQL Federation.
+
+### The Concept (One Graph, Many Services)
+Instead of one giant "Monolith" server, you break your graph into **Subgraphs**.
+
+*   **User Subgraph:** Owned by Identity Team. Manages `User` type.
+*   **Product Subgraph:** Owned by Catalog Team. Manages `Product` type.
+*   **Review Subgraph:** Owned by Social Team. Manages `Review` type.
+
+### The Architecture
+You sit a **Gateway** (Router) in front of them using tools like **Apollo Federation**.
+
+```mermaid
+graph TD
+    Client -->|Query| G[Gateway / Supergraph]
+    G -->|User Query| A[User Subgraph (Python)]
+    G -->|Product Query| B[Product Subgraph (Java)]
+    G -->|Review Query| C[Review Subgraph (Go)]
+```
+
+### Entities (The Magic Glue)
+How do you link a Review to a Product? You use **Entities**.
+
+*   **Product Subgraph:** Defines `Product @key(fields: "id")`.
+*   **Review Subgraph:** Extends `Product` and adds a field `reviews`.
+
+The Gateway automatically "stitches" these together. The client has no idea it's talking to 3 services. It just sees **One Graph**.
+
+### Summary
+*   **Without Federation:** 50 REST APIs or 1 Giant Unmaintainable GraphQL Monolith.
+*   **With Federation:** Independent teams, unified API.
+
 
 
