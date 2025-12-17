@@ -168,6 +168,22 @@ Don't be the developer who returns `200 OK` for an error.
 Your API **will** change. If you don't version from Day 1, you will break mobile apps.
 *   ❌ **Bad:** `api.example.com/users`
 *   ✅ **Good:** `api.example.com/v1/users`
-    *   When you need to make a breaking change, you launch `/v2/users`.
-    *   Old apps continue working on `/v1/`.
+
+### Rule 4: Query vs Path Params
+"When should I use `/users/12` vs `/users?id=12`?"
+
+*   **Path Params (`/users/12`):** Use when you are identifying a specific **resource**.
+    *   It is mandatory. You cannot have "User" without an ID.
+    *   Think of it like a file path (`folder/file.txt`).
+*   **Query Params (`/users?role=admin`):** Use when you are **sorting**, **filtering**, or **paginating**.
+    *   It is optional. The list of users exists even without the filter.
+    *   Think of it like `ls -l` (The `-l` is a flag).
+
+| Pattern | Usage | Good? |
+| :--- | :--- | :--- |
+| `/users/123` | Fetching a specific thing | ✅ |
+| `/users/123/orders` | Fetching sub-resources of a specific thing | ✅ |
+| `/users?id=123` | Fetching a specific thing | ❌ (Bad Practice) |
+| `/users?sort=asc` | Modifying the *view* of the resources | ✅ |
+
 
