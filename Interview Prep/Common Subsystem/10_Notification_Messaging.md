@@ -69,7 +69,7 @@ Chat generates massive data.
 ## 5. High-Level Design
 
 ```mermaid
-graph LR
+graph TD
     Source["Internal Svc (Order)"] -->|Event: Shipped| Q["Kafka (Notification Topic)"]
     Q -->|Consume| Notif_Processor["Notification Worker"]
     
