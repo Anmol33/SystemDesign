@@ -6,7 +6,54 @@ Enter **gRPC** (Google Remote Procedure Call), open-sourced in 2015.
 
 ---
 
-## 1. Evolution: Why reinvent the wheel?
+## 1. What is RPC (Remote Procedure Call)?
+
+Before we understand gRPC, we must understand **RPC**.
+
+### The Concept: "The Local Illusion"
+In a normal program, if you want to calculate a sum, you call a function:
+```python
+result = add(5, 10) // Included in the same memory space
+```
+
+**RPC** tries to keep this exact same simplicity, even if the `add` function is on a server in Japan and you are in New York.
+```python
+# The Code looks local...
+result = client.add(5, 10) 
+# ...but the execution happens across the ocean!
+```
+
+### Under the Hood: The "Stub" Mechanism
+How does the code know to go to Japan?
+
+1.  **Client Stub:** A piece of auto-generated code that looks like the real function. It takes your variables (`5, 10`), packages them (Serialization), and sends them over the network.
+2.  **Network Transport:** The package travels over HTTP/TCP.
+3.  **Server Stub:** Receives the package, unpacks it (Deserialization), and calls the *actual* `add` function on the server.
+
+```mermaid
+sequenceDiagram
+    participant App as Client App
+    participant Stub as Client Stub
+    participant Net as Network
+    participant Server as Server Stub
+    
+    App->>Stub: call add(5, 10)
+    Note right of Stub: Serializes to bytes
+    Stub->>Net: Send Request
+    Net->>Server: Transport...
+    Note right of Server: Deserializes
+    Server->>Server: Run actual add(5, 10)
+    Server-->>Net: Return 15
+    Net-->>Stub: Transport...
+    Stub-->>App: Return 15
+```
+
+### The Catch
+While the *syntax* looks local, the *reality* is different. A local function call takes nanoseconds and never fails. An RPC call takes milliseconds and can fail (Network timeout, Server down).
+
+---
+
+## 2. Evolution: Why reinvent the wheel?
 
 1.  **XML-RPC / SOAP (1998):**
     *   Strict, Enterprise-ready, but **Huge and Complex**. Parsing XML is CPU expensive.
