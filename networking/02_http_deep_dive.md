@@ -148,18 +148,48 @@ sequenceDiagram
 ## 4. Advanced Features
 
 ### A. HPACK (Header Compression)
-*   **Problem:** Sending `User-Agent: Mozilla/5.0...` (100 bytes) on every single request is wasteful.
-*   **Solution:** Both Client and Server maintain a **Lookup Table**.
-    *   First Request: Send full `User-Agent`. Server says "Ah, I'll save that at Index 1."
-    *   Second Request: Send `0x01` (Index 1). Server expands it to the full string.
+*   **Problem:** In HTTP 1.1, headers are stateless. sending `User-Agent: Mozilla/5.0...` (100 bytes) on every request is huge overhead.
+*   **Solution:** HPACK uses **Lookup Tables**. Both Client and Server maintain the exact same state.
 
-#### The Savings (Example)
-| Header Sent | HTTP 1.1 (Text) | HTTP 2.0 (HPACK Index) | Savings |
+#### How it works: Two Tables
+1.  **Static Table:** A hardcoded list of common headers (e.g., Index `2` is always `:method: GET`).
+2.  **Dynamic Table:** A runtime list that grows as we exchange new headers.
+
+#### Step-by-Step Walkthrough
+Let's see how we save those bytes.
+
+**Request 1: The "Learning" Phase**
+We want to send:
+*   `:method: GET`
+*   `user-agent: Chrome/90.0...` (Custom string)
+
+1.  **:method: GET**:
+    *   Found in **Static Table** (Index 2).
+    *   **Action:** Send `0x82` (1 byte representing Index 2).
+2.  **user-agent**:
+    *   Not found in any table.
+    *   **Action:** Send the full string literal ("Chrome...").
+    *   **Crucial Step:** Both sides add `user-agent: Chrome...` to the **Dynamic Table** at Index **62**.
+
+**Request 2: The "Compression" Phase**
+We send the exact same headers again.
+
+1.  **:method: GET**:
+    *   Found in Static Table (Index 2).
+    *   **Action:** Send `0x82` (1 byte).
+2.  **user-agent**:
+    *   Found in **Dynamic Table** (Index 62).
+    *   **Action:** Send `0xBE` (1 byte representing Index 62).
+
+**Result:** The 100-byte string turned into a single byte on the second try.
+
+#### The Savings Table Explained
+| Header Sent | Mechanism | Cost | Savings |
 | :--- | :--- | :--- | :--- |
-| `method: GET` | ~11 bytes | 1 byte | 90% |
-| `scheme: https` | ~13 bytes | 1 byte | 92% |
-| `host: example.com` | ~17 bytes | ~17 bytes (1st time) | 0% |
-| `user-agent: ...` | ~100 bytes | **1 byte** (2nd time) | **99%** |
+| `method: GET` | **Static Table** (Index 2) | 1 byte | 90% |
+| `scheme: https` | **Static Table** (Index 7) | 1 byte | 92% |
+| `host: example.com` | **Literal** (Dynamic Table miss) | ~17 bytes (1st time) | 0% |
+| `user-agent: ...` | **Dynamic Table** (Index 62) | **1 byte** (2nd time) | **99%** |
 
 ### B. Server Push (`PUSH_PROMISE`)
 The server can send a resource *before* the client asks for it.
