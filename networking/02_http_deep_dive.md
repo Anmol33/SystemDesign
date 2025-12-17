@@ -67,12 +67,28 @@ While we reuse the connection, the request/response pairing relies on **Strict F
 
 HTTP 2.0 (2015) solves HOL Blocking by changing the fundamental unit of communication.
 
-### The Paradigm Shift: Binary Frames
-Instead of sending "Text Lines", we send "Binary Frames".
+### The Paradigm Shift: Binary Frames vs Text Lines
+In HTTP 1.1, we spoke "Human". In HTTP 2.0, we speak "Machine".
 
-*   **Why Binary?**
-    *   **Speed:** Machines can read a "Length Header" (e.g., 3 bytes) and instantly jump forward. No need to scan for newlines.
-    *   **Robustness:** No ambiguity about whitespace or encoding.
+#### 1. Text Lines (Hard for Machines)
+*   **The Problem:** To know when a line ends, the CPU must check **every single byte** for a newline (`\r\n`).
+*   **The Risk:** If a user puts a newline inside a header value by accident, the protocol breaks.
+
+```text
+GET / HTTP/1.1 [Unknown Length -> Scan until \n]
+Host: example.com [Unknown Length -> Scan until \n]
+```
+
+#### 2. Binary Frames (Easy for Machines)
+*   **The Solution:** We start with a **Length** number.
+*   **The Speed:** The CPU reads "Length: 50". It immediately **jumps** 50 bytes forward to the next frame. It doesn't look at the content at all.
+*   **The Result:** Much faster parsing and lower CPU usage.
+
+```text
+[Length: 12] [Type: DATA] [Payload: Hello World!]
+^
+|___ CPU reads "12" and skips exactly 12 bytes.
+```
 
 #### The Frame Structure
 Every slice of data is wrapped in an envelope:
