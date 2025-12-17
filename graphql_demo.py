@@ -60,8 +60,27 @@ class Query:
                 return User(**u)
         return None
 
+
+# --- Mutation Definition ---
+
+@strawberry.type
+class Mutation:
+    @strawberry.mutation
+    def create_user(self, name: str, email: str) -> User:
+        new_id = str(len(users_db) + 1)
+        new_user = {"id": new_id, "name": name, "email": email}
+        users_db.append(new_user)
+        return User(**new_user)
+
+    @strawberry.mutation
+    def create_post(self, title: str, author_id: str) -> Post:
+        new_id = str(len(posts_db) + 101) # Simple ID gen
+        new_post = {"id": new_id, "title": title, "author_id": author_id}
+        posts_db.append(new_post)
+        return Post(id=new_id, title=title, author_id=author_id)
+
 # --- App Setup ---
-schema = strawberry.Schema(query=Query)
+schema = strawberry.Schema(query=Query, mutation=Mutation)
 graphql_app = GraphQLRouter(schema)
 
 app = FastAPI()

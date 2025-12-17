@@ -150,3 +150,29 @@ query {
 
 **Result:** You get a JSON with exactly this shape. No more, no less.
 
+### 4. Try this Mutation (Write Data)
+In GraphQL, we use **Mutations** to modify data.
+
+```graphql
+mutation {
+  createUser(name: "Charlie", email: "charlie@new.com") {
+    id
+    name
+  }
+}
+```
+
+**Result:**
+```json
+{
+  "data": {
+    "createUser": {
+      "id": "3",
+      "name": "Charlie"
+    }
+  }
+}
+```
+Now you can run the **Query** again, and you'll see Charlie in the list!
+
+
