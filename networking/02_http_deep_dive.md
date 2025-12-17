@@ -84,6 +84,34 @@ Every slice of data is wrapped in an envelope:
 +-----------------------+-----------------------------+
 ```
 
+#### Example: Splitting a Large JSON Response
+Imagine the Server wants to send a 20KB JSON file on **Stream 5**. It cannot send it as one giant block (that would block other streams). It splits it into frames.
+
+**1. The Logical Data:**
+`HTTP/2 200 OK` ... `{"users": [ ... huge list ... ]}`
+
+**2. The Physical Frames on the Wire:**
+
+**Frame 1: The Headers (Type=0x01)**
+```text
+[Length: 10] [Type: HEADERS] [StreamID: 5]
+Payload: :status: 200, content-type: json
+```
+
+**Frame 2: Data Chunk 1 (Type=0x00)**
+```text
+[Length: 16384] [Type: DATA] [StreamID: 5]
+Payload: {"users": ["Alice", "Bob", ... (first 16KB)
+```
+
+**Frame 3: Data Chunk 2 (Type=0x00) (End Stream)**
+```text
+[Length: 3616] [Type: DATA] [StreamID: 5] [Flags: END_STREAM]
+Payload: ... "Charlie", "Dave"]}
+```
+
+*Note: Between Frame 2 and Frame 3, the server might send a frame for Stream 7. This is interleaving!*
+
 ### The Architecture: Streams & Multiplexing
 How do we send multiple files at once without mixing them up?
 
