@@ -107,6 +107,12 @@ graph TD
 - *Pro*: **Read is O(1)**. Extremely fast.
 - *Con*: **Write Amplification**. If Bieber has 100M followers, 1 post = 100M Redis writes. This causes huge "lag".
 
+    > **Why 600M READS ≠ 600M WRITES?**
+    > 1. **Reads are cheaper than writes**: Redis reads are O(1) memory-only. Writes involve replication, persistence (AOF), and contention. (Cost: 1 Write ≈ 10 Reads).
+    > 2. **Reads are spread over time**: 600M followers don't log in simultaneously. Writes happen in an instant "Fan-out" spike.
+    > 3. **Caching kills reads**: Most reads hit local browser/CDN caches. Writes *must* hit the DB.
+    > 4. **Amplification**: Push = 100M index updates. Pull = 1 row update.
+
 **Pull Model (Fan-out on Read)**:
 - *How*: When I read, query all my followings' recent posts and merge them in memory.
 - *Pro*: No Storage cost. No write lag.
