@@ -20,14 +20,14 @@ The TaskManager does the heavy lifting.
 ```mermaid
 graph TD
     subgraph JobManager
-        Disp[Dispatcher] --> JM[JobMaster (Per Job)]
-        JM --> RM[ResourceManager]
+        Disp["Dispatcher"] --> JM["JobMaster (Per Job)"]
+        JM --> RM["ResourceManager"]
     end
 
     subgraph TaskManager
-        Netty[Netty Network Stack]
-        Slot1[Task Slot 1]
-        Slot2[Task Slot 2]
+        Netty["Netty Network Stack"]
+        Slot1["Task Slot 1"]
+        Slot2["Task Slot 2"]
     end
 
     JM <-->|Checkpoint Barriers| Slot1
@@ -106,3 +106,61 @@ To guarantee Exactly-Once Output to Kafka:
 | `state.backend` | `rocksdb` | Heap is dangerous for large state. |
 | `execution.checkpointing.unaligned` | `true` | **Crucial**. Allows barriers to skip queued data, preventing timeouts during backpressure. |
 | `taskmanager.memory.network.fraction` | `0.1` | Increase if backpressure errors occur. |
+
+---
+
+## Chapter 7: End-to-End Walkthrough: The Flow of the Stream
+
+Let's trace a Flink Job from submission to processing to see how the "Trinity" and "Stack" interact.
+
+### 1. Submission Phase
+*   **User**: Runs `flink run -d my-job.jar`.
+*   **Dispatcher**: Receives the `JobGraph`. Spins up a **JobMaster**.
+*   **ResourceManager**: Asks K8s for Pods. Allocates **TaskSlots**.
+
+### 2. Execution Phase
+*   **JobMaster**: Deploys tasks to TaskSlots.
+*   **TaskSlot**:
+    *   Allocates Memory (Managed Memory & Network Buffers).
+    *   Starts the Operator Chain: `Source -> Map -> Window -> Sink`.
+
+### 3. The Processing Loop
+*   **Source**: Reads from Kafka.
+*   **Network Stack**:
+    *   Serializes record into specific **Netty Buffers** (32KB chunks).
+    *   **Credit Check**: Asks downstream: "Do you have space?"
+    *   **Transfer**: If Yes, sends buffer. If No, waits (Backpressure).
+
+---
+
+## Chapter 8: Failure Scenarios (The Senior View)
+
+### 1. Failure Scenario A: The Backpressure Deadlock
+**Symptom**: Job is running (Green in UI), but Throughput is 0.
+**Cause**: Downstream Sink (e.g., Postgres) is slow.
+**Mechanism**:
+1.  **Sink** fills its input buffers.
+2.  **Netty** stops sending credits upstream.
+3.  **Source** fills its output buffers and stops reading from Kafka.
+**Visual**:
+```mermaid
+graph LR
+    DB[("Slow DB")] 
+    Sink["Sink Task"] --"Wait"--> DB
+    Sink_Buf["Input Buffer Full"] -.-> Sink
+    Source["Source Task"] --"No Credits"--> Sink_Buf
+    Kafka(("Kafka")) --"Stops Reading"--> Source
+    
+    style Sink_Buf fill:#ff9999
+    style DB fill:#ff9999
+```
+
+### 2. Failure Scenario B: The Barrier Alignment Timeout
+**Symptom**: `CheckpointExpiredException`.
+**Cause**: **Data Skew**. One operator instance is processing 90% of data.
+**Mechanism**:
+1.  **Checkpoint Coordinator** sends Barrier ID=5.
+2.  **Fast Task** processes Barrier 5 and waits.
+3.  **Slow Task** (Skewed) has 1GB of data *before* Barrier 5 in its queue.
+4.  **Result**: Fast Task waits for minutes. Checkpoint times out before Slow Task sees Barrier 5.
+**Fix**: Use `execution.checkpointing.unaligned = true` to let Barriers jump the queue.

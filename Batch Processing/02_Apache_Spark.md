@@ -139,5 +139,83 @@ sequenceDiagram
 
 ---
 
-## Conclusion
+## Chapter 6: End-to-End Walkthrough: Life and Death of a Query
+
+Let's trace a SQL query from submission to completion to see how the "Brain" and "Muscle" interact.
+
+### 1. Submission Phase
+*   **User**: Runs `spark-submit --deploy-mode cluster my-job.jar`.
+*   **Cluster Manager (YARN/K8s)**: Allocates a container for the **Driver**.
+*   **Driver Boot**: The JVM starts. The `SparkContext` initializes the `DAGScheduler`, `TaskScheduler`, and `BlockManagerMaster`.
+
+### 2. Planning Phase
+*   **Code**: `df.groupBy("id").count()`
+*   **Catalyst**: Parses SQL -> Logical Plan -> Optimized Plan -> Physical Plan.
+*   **DAGScheduler**:
+    *   Sees a `Exchange` (Shuffle) in the physical plan.
+    *   Breaks the job into **Stage 0** (Read + Map) and **Stage 1** (Reduce).
+
+### 3. Execution Phase (Stage 0)
+*   **TaskScheduler**: Gets a `TaskSet` of 1000 tasks (one per file).
+*   **Locality Wait**: Checks where the blocks effectively live (HDFS/S3). Tries `NODE_LOCAL`.
+*   **Executor**:
+    *   Received `TaskDescription`.
+    *   Thread runs: Read Parquet -> Extract "id" -> Write to **Local Disk** (Shuffle Write).
+    *   **BlockManager**: Reports to Driver: "I have shuffle block `shuffle_0_1_0` size 50MB".
+
+### 4. The Shuffle Phase & Stage 1
+*   **DAGScheduler**: Marks Stage 0 as Success. Submits Stage 1.
+*   **Executor (Stage 1)**:
+    *   Task needs data for key "user_123".
+    *   **MapOutputTracker**: Asks Driver "Who has the blocks?"
+    *   **ShuffleClient**: Connects to Executor A, B, and C to fetch the relevant chunks.
+
+---
+
+## Chapter 7: Failure Scenarios (The Senior View)
+
+Debugging is about understanding *where* the chain broke.
+
+### 1. Failure Scenario A: The Driver OOM
+**Symptom**: `java.lang.OutOfMemoryError: Java heap space` on the Driver.
+**Cause**: Calling `.collect()` or `.take(N)` on a huge dataset.
+*   **Mechanism**: `collect()` forces all Executors to serialize their results and send them to the Driver's `BlockManager`.
+*   **Visual**:
+    ```mermaid
+    graph TD
+        E1["Executor 1"] -- "Result (1GB)" --> D["Driver (Heap: 1GB)"]
+        E2["Executor 2"] -- "Result (1GB)" --> D
+        style D fill:#ff9999
+    ```
+
+### 2. Failure Scenario B: The Shuffle Fetch Fail
+**Symptom**: `FetchFailedException` followed by `Resubmitting Stage`.
+**Cause**: An Executor acting as a "Shuffle Server" crashed (OOM or Spot Instance loss).
+**Recovery**:
+1.  **ShuffleClient** tries to fetch block from Executor X. Fails.
+2.  **TaskScheduler** marks task failed.
+3.  **DAGScheduler** realizes the *Source Data* is gone.
+4.  **Action**: It **Resubmits the Previous Stage** to regenerate the missing shuffle files.
+
+### 3. Failure Scenario C: The Executor OOM (The Skewed Partition)
+**Symptom**: `Pod OOMKilled (Exit Code 137)` in Kubernetes.
+**Cause**: **Data Skew**. One partition is 10GB, while others are 100MB.
+*   **Mechanism**: The Executor tries to load the 10GB partition into the "Execution Memory" (Unified Memory) for sorting/shuffling. It spills to disk, but if the metadata pointers alone exceed overhead, it crashes.
+*   **Visual**:
+    ```mermaid
+    graph TD
+        P1["Partition 1 (100MB)"] --> E1["Executor 1 (Safe)"]
+        P2["Partition 2 (10GB!)"] --> E2["Executor 2 (OOM Crash)"]
+        style E2 fill:#ff9999
+    ```
+
+### 4. Failure Scenario D: The Serialization Trap
+**Symptom**: `java.io.NotSerializableException`
+**Cause**: Accessing a non-serializable object (like a socket or DB connection) inside a `map()` function.
+*   **Mechanism**: Spark must **Serialize** the code (Closure) on the Driver to send it to the Executor. If the closure references an open connection, serialization fails because connections are tied to the machine's OS handle.
+*   **The Fix**: Create the connection *inside* `mapPartitions()`, not on the Driver.
+
+---
+
+## Chapter 8: Conclusion
 Mastery of Spark requires thinking less like a SQL analyst and more like a kernel developer—managing memory pages, serialization overheads, and network physics.
