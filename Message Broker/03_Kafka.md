@@ -324,7 +324,54 @@ sequenceDiagram
 
 **When This Happens**: Using `enable.auto.commit=false` with manual commit **after** a batch.
 
-**The Fix**: Implement **idempotent processing** (e.g., use unique transaction IDs, upsert operations).
+**The Fix**: Implement **idempotent processing** (process the same message multiple times with the same effect).
+
+**Option 1: Transaction ID (Deduplication)**
+```java
+public void processPayment(PaymentEvent event) {
+    String txnId = event.transactionId; // Unique ID from producer
+    
+    try {
+        // Try to insert (prevents duplicates via primary key)
+        db.execute(
+            "INSERT INTO transactions (id, amount, user_id) VALUES (?, ?, ?)",
+            txnId, event.amount, event.userId
+        );
+        
+        // Deduct balance only if insert succeeded
+        db.execute("UPDATE accounts SET balance = balance - ? WHERE user_id = ?",
+                   event.amount, event.userId);
+                   
+    } catch (DuplicateKeyException e) {
+        // Duplicate message -> Already processed -> Skip
+        logger.info("Duplicate transaction: " + txnId);
+    }
+}
+```
+
+**Option 2: UPSERT (Insert or Update)**
+```java
+// Idempotent: Running twice has same effect as running once
+db.execute(
+    "INSERT INTO user_profiles (user_id, email, updated_at) " +
+    "VALUES (?, ?, NOW()) " +
+    "ON CONFLICT (user_id) DO UPDATE SET email = EXCLUDED.email",
+    event.userId, event.email
+);
+```
+
+**Option 3: Check-Then-Act**
+```java
+// Check if already processed
+if (orderRepo.existsById(event.orderId)) {
+    logger.info("Order already processed");
+    return; // Idempotent
+}
+
+// Process only if not exists
+Order order = new Order(event.orderId, event.items);
+orderRepo.save(order);
+```
 
 ---
 
@@ -454,11 +501,123 @@ try {
 ### C. Global Geo-Replication (MirrorMaker 2)
 Kafka clusters are regional due to ISR latency requirements.
 
-**Cross-Region Strategy**:
-*   **Cluster A** (US-East).
-*   **Cluster B** (EU-West).
-*   **MirrorMaker 2 (MM2)**: Consumer on A, Producer on B.
-*   **Modes**: Active-Passive (DR) or Active-Active (bidirectional).
+**What is ISR (In-Sync Replicas)?**
+
+ISR is the set of replica brokers that are **fully caught up** with the partition leader. Kafka only acknowledges writes when all ISR replicas have written the message (when `acks=all`).
+
+**Why Regional?**
+```
+Single Region (us-east-1):
+- Leader in AZ-1a, Follower in AZ-1b
+- Network latency: 1-2ms
+- ISR stable: ✅ Replicas stay in-sync
+
+Multi-Region (us-east-1 to eu-west-1):
+- Leader in US, Follower in Europe
+- Network latency: 80-100ms
+- ISR timeout: replica.lag.time.max.ms = 10s
+- Result: ❌ Replicas frequently drop from ISR (unstable)
+```
+
+**The Problem**: Cross-region latency (80ms+) causes followers to lag and drop from ISR, leading to write failures.
+
+**Cross-Region Strategy**: Use separate regional clusters with **MirrorMaker 2** for async replication.
+
+#### Architecture
+
+```mermaid
+graph TD
+    subgraph US["Primary Cluster (us-east-1)"]
+        US_B1["Broker 1"]
+        US_B2["Broker 2"]
+        US_B3["Broker 3"]
+        US_ISR["ISR: All 3 brokers<br/>(1-2ms latency)"]
+    end
+    
+    subgraph EU["Mirror Cluster (eu-west-1)"]
+        EU_B1["Broker 1"]
+        EU_B2["Broker 2"]
+        EU_B3["Broker 3"]
+        EU_ISR["ISR: All 3 brokers<br/>(1-2ms latency)"]
+    end
+    
+    MM2["MirrorMaker 2<br/>(Async Replication)"]
+    
+    US_B1 --> MM2
+    MM2 -.->|"80ms latency<br/>(Eventual consistency)"| EU_B1
+    
+    style US_ISR fill:#ccffcc
+    style EU_ISR fill:#ccffcc
+    style MM2 fill:#e6ccff
+```
+
+**How It Works**:
+1.  **US Cluster**: Serves US traffic with local ISR (3 replicas, 1-2ms).
+2.  **MirrorMaker 2**: Kafka Connect-based consumer/producer.
+   - Consumes from US cluster
+   - Produces to EU cluster (async, no ISR dependency)
+3.  **EU Cluster**: Serves EU traffic with local ISR (3 replicas).
+
+**Key Benefits**:
+*   Each region has its own stable ISR
+*   Cross-region replication is **async** (doesn't block writes)
+*   EU cluster can serve local reads with low latency
+
+#### Configuration Example
+
+**MirrorMaker 2 Config**:
+```properties
+# Source cluster (US)
+clusters = us, eu
+us.bootstrap.servers = us-kafka-1:9092,us-kafka-2:9092
+eu.bootstrap.servers = eu-kafka-1:9092,eu-kafka-2:9092
+
+# Replication flow: US -> EU
+us->eu.enabled = true
+us->eu.topics = orders.*, payments.*  # Replicate these topics
+
+# Consumer config (read from US)
+us->eu.consumer.group.id = mm2-us-to-eu
+
+# Producer config (write to EU)
+us->eu.producer.acks = all
+us->eu.producer.compression.type = lz4
+
+# Sync settings
+sync.topic.configs.enabled = true
+sync.topic.acls.enabled = true
+```
+
+#### Topic Naming
+
+MirrorMaker 2 prefixes topics with the source cluster name:
+```
+US Cluster:
+- orders
+- payments
+
+EU Cluster (after replication):
+- us.orders       <- Replicated from US
+- us.payments     <- Replicated from US
+- local-eu-orders <- Local EU topic (not replicated)
+```
+
+#### Failover Strategy
+
+**Active-Passive** (Most Common):
+```
+Normal: US cluster (active), EU cluster (passive backup)
+Disaster: Switch DNS to EU cluster, EU becomes active
+```
+
+**Active-Active** (Complex):
+```
+US users -> US cluster (writes local topics)
+EU users -> EU cluster (writes local topics)
+MirrorMaker: Bidirectional replication (conflict resolution needed)
+```
+
+**Replication Lag**: Typically 100ms-1s (acceptable for DR scenarios, not for real-time sync).
 
 ---
 
