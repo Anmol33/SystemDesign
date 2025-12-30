@@ -173,39 +173,141 @@ Let's trace a Flink Job from submission to processing.
 ## 6. Failure Scenarios (The Senior View)
 
 ### Scenario A: The Backpressure Deadlock
-**Symptom**: Job is running (Green in UI), but Throughput is 0.
+
+**Symptom**: Job is running (Green in UI), but Throughput is 0. Metrics show high backpressure.
 **Cause**: Downstream Sink (e.g., Postgres) is slow.
 
-**Mechanism**:
-1.  **Sink** fills its input buffers.
-2.  **Netty** stops sending credits upstream.
-3.  **Source** fills its output buffers and stops reading from Kafka.
+#### The Mechanism
 
+Flink uses **Credit-Based Flow Control** to prevent buffer overflow.
+
+**The Credit System**:
+1.  **Downstream Task** has input buffers (e.g., 10 buffers of 32KB each).
+2.  **Downstream** sends "credits" to **Upstream**: "I have 10 free buffers, you can send 10 chunks."
+3.  **Upstream** sends data only if it has credits.
+
+**The Deadlock**:
 ```mermaid
 graph LR
-    DB[("Slow DB")] 
-    Sink["Sink Task"] --"Wait"--> DB
-    Sink_Buf["Input Buffer Full"] -.-> Sink
-    Source["Source Task"] --"No Credits"--> Sink_Buf
-    Kafka(("Kafka")) --"Stops Reading"--> Source
+    DB[("Slow DB<br/>(100ms/write)")] 
+    Sink["Sink Task<br/>(Input Buffer Full)"] --"Wait"--> DB
+    Sink_Buf["Input Buffer<br/>(0 credits available)"] -.-> Sink
+    Source["Source Task<br/>(Reading Kafka)"] --"No Credits<br/>BLOCKED"--> Sink_Buf
+    Kafka(("Kafka")) --"Stops Reading<br/>(Lag grows)"--> Source
     
     style Sink_Buf fill:#ff9999
     style DB fill:#ff9999
 ```
 
-**The Fix**: Scale the sink (more parallel instances) or use async I/O.
+**Step-by-Step**:
+1.  **Sink writes to DB** at 100ms per record.
+2.  **Upstream sends 10 records** (fills all 10 buffers).
+3.  **Sink's buffers are full** → Sends 0 credits to upstream.
+4.  **Upstream stops sending** (waiting for credits).
+5.  **Source stops reading from Kafka** (backpressure propagates).
+6.  **Result**: Job appears healthy (no errors), but **Kafka lag grows**.
+
+#### The Fix
+
+**Option 1: Scale the Sink (More Parallel Instances)**
+```yaml
+# Increase sink parallelism in job config
+sink.parallelism: 10  # Was 1, now 10
+```
+
+**Option 2: Use Async I/O (Non-Blocking Writes)**
+```java
+// BAD: Synchronous DB write (blocks)
+public void invoke(Event event, Context context) {
+    database.write(event);  // Waits for DB
+}
+
+// GOOD: Async I/O (doesn't block)
+AsyncDataStream.orderedWait(
+    stream,
+    new AsyncDatabaseRequest(),
+    60000,  // Timeout 60s
+    TimeUnit.MILLISECONDS,
+    100     // Max concurrent requests
+)
+```
+
+**Option 3: Increase Network Buffers**
+```
+taskmanager.memory.network.fraction: 0.2  # Was 0.1, now 20% of memory
+taskmanager.network.numberOfBuffers: 4096  # Increase buffer pool
+```
+
+---
 
 ### Scenario B: The Barrier Alignment Timeout
-**Symptom**: `CheckpointExpiredException`.
+
+**Symptom**: `CheckpointExpiredException: Checkpoint 123 expired before completing`.
 **Cause**: **Data Skew**. One operator instance is processing 90% of data.
 
-**Mechanism**:
-1.  **Checkpoint Coordinator** sends Barrier ID=5.
-2.  **Fast Task** processes Barrier 5 and waits.
-3.  **Slow Task** (Skewed) has 1GB of data *before* Barrier 5 in its queue.
-4.  **Result**: Fast Task waits for minutes. Checkpoint times out before Slow Task sees Barrier 5.
+#### The Mechanism
 
-**The Fix**: Use `execution.checkpointing.unaligned = true` to let Barriers jump the queue.
+Flink's **Chandy-Lamport** checkpointing requires **barrier alignment** across all input streams.
+
+**The Alignment Problem**:
+```mermaid
+sequenceDiagram
+    participant Coord as Checkpoint Coordinator
+    participant Fast as Fast Task<br/>(10 records/sec)
+    participant Slow as Slow Task<br/>(1 record/sec)<br/>[Data Skew]
+    
+    Coord->>Fast: Barrier ID=5
+    Coord->>Slow: Barrier ID=5
+    
+    rect rgb(200, 255, 200)
+        Note over Fast: Processes 10 records<br/>Sees Barrier 5<br/>(1 second)
+        Fast->>Fast: Snapshot State
+        Fast->>Coord: ACK Barrier 5
+    end
+    
+    rect rgb(255, 200, 200)
+        Note over Slow: Processing 100 records<br/>Before Barrier 5...<br/>(100 seconds!)
+        Note over Coord: Timeout after 60s<br/>Checkpoint FAILED
+    end
+```
+
+**Step-by-Step**:
+1.  **Checkpoint Coordinator** sends Barrier 5 to all tasks.
+2.  **Fast Task** processes 10 records, sees Barrier 5, snapshots → ACKs in 1 second.
+3.  **Slow Task** has 100 skewed records queued *before* Barrier 5.
+4.  **Slow Task** takes 100 seconds to reach Barrier 5.
+5.  **Timeout**: Checkpoint expires after 60s (config: `execution.checkpointing.timeout`).
+6.  **Result**: Checkpoint 5 fails. Job continues, but recovery window grows.
+
+#### The Fix
+
+**Option 1: Enable Unaligned Checkpoints (CRITICAL)**
+```yaml
+execution.checkpointing.unaligned: true
+```
+
+**How It Works**: Barriers can "jump ahead" of queued data. Flink snapshots the in-flight data as well.
+
+**Before (Aligned)**:
+- Barrier waits for all 100 records to process.
+
+**After (Unaligned)**:
+- Barrier jumps ahead, snapshots the 100 queued records.
+- Checkpoint completes in milliseconds.
+
+**Option 2: Fix Data Skew (Add Salt to Keys)**
+```java
+// BAD: Skewed key (99% of data has user_id=123)
+stream.keyBy(event -> event.getUserId())
+
+// GOOD: Add random suffix
+stream.keyBy(event -> event.getUserId() + "_" + (event.hashCode() % 10))
+```
+
+**Option 3: Increase Checkpoint Timeout**
+```yaml
+execution.checkpointing.timeout: 300000  # 5 minutes (was 60s)
+```
 
 ---
 

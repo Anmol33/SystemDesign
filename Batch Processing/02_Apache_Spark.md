@@ -188,44 +188,190 @@ Let's trace a SQL query from submission to completion.
 Debugging is about understanding *where* the chain broke.
 
 ### Scenario A: The Driver OOM
+
 **Symptom**: `java.lang.OutOfMemoryError: Java heap space` on the Driver.
 **Cause**: Calling `.collect()` or `.take(N)` on a huge dataset.
-*   **Mechanism**: `collect()` forces all Executors to serialize their results and send them to the Driver's `BlockManager`.
+
+#### The Mechanism
+
+When you call `collect()`, Spark performs the following:
+1.  **Executor Side**: All executors serialize their partition results into their `BlockManager`.
+2.  **Network Transfer**: Each executor sends its serialized data to the Driver's `BlockManager` over the network.
+3.  **Driver Side**: The Driver JVM heap must hold **all** results in memory simultaneously.
+
+**The Problem**: If you have 100 executors, each with 1GB of results, the Driver needs 100GB of heap. Most drivers are configured with 1-4GB only.
 
 ```mermaid
 graph TD
-    E1["Executor 1"] -- "Result (1GB)" --> D["Driver (Heap: 1GB)"]
-    E2["Executor 2"] -- "Result (1GB)" --> D
+    E1["Executor 1<br/>(1GB result)"] -- "Network" --> D["Driver<br/>(Heap: 1GB)<br/>OOMError!<br/>100GB > 1GB"]
+    E2["Executor 2<br/>(1GB result)"] -- "Network" --> D
+    E3["Executor 3<br/>(1GB result)"] -- "Network" --> D
+    
     style D fill:#ff9999
 ```
 
+#### The Fix
+
+**Option 1: Don't Use `.collect()`**
+```scala
+// BAD: Collects all data to driver
+val results = df.collect()  // OOM if large!
+
+// GOOD: Write to distributed storage
+df.write.mode("overwrite").parquet("s3://bucket/output")
+```
+
+**Option 2: Sample Data**
+```scala
+// Collect only a sample
+val sample = df.sample(0.01).collect()  // Only 1% of data
+```
+
+**Option 3: Increase Driver Memory**
+```
+spark-submit --driver-memory 16g ...
+```
+
+---
+
 ### Scenario B: The Shuffle Fetch Fail
-**Symptom**: `FetchFailedException` followed by `Resubmitting Stage`.
+
+**Symptom**: `FetchFailedException: Failed to fetch block shuffle_1_2_0`.
 **Cause**: An Executor acting as a "Shuffle Server" crashed (OOM or Spot Instance loss).
 
-**Recovery**:
-1.  **ShuffleClient** tries to fetch block from Executor X. Fails.
-2.  **TaskScheduler** marks task failed.
-3.  **DAGScheduler** realizes the *Source Data* is gone.
-4.  **Action**: It **Resubmits the Previous Stage** to regenerate the missing shuffle files.
+#### The Mechanism
+
+Spark's shuffle has two phases:
+1.  **Shuffle Write** (Map side): Executor A writes shuffle files to its local disk.
+2.  **Shuffle Read** (Reduce side): Executor B fetches those files from Executor A over the network.
+
+**The Failure**:
+1.  **Stage 1** (Map): Executor A writes `shuffle_1_2_0` to disk.
+2.  **Executor A Crashes**: OOM, spot instance termination, or hardware failure.
+3.  **Stage 2** (Reduce): Executor B tries to fetch `shuffle_1_2_0` from Executor A.
+4.  **Network Error**: Connection refused (Executor A is dead).
+5.  **TaskScheduler**: Marks task as `FetchFailedException`.
+6.  **DAGScheduler**: Realizes the shuffle data is lost → **Resubmits Stage 1** to regenerate it.
+
+#### The Fix
+
+**Immediate**: The resubmit is automatic. No action required.
+
+**Long-term Prevention**:
+1.  **Enable External Shuffle Service** (persists shuffle data even if executor dies):
+   ```
+   spark.shuffle.service.enabled=true
+   ```
+2.  **Use Stable Instances**: Avoid spot instances for executors if possible.
+3.  **Increase Executor Memory**: Reduce OOM likelihood.
+
+---
 
 ### Scenario C: The Executor OOM (Data Skew)
-**Symptom**: `Pod OOMKilled (Exit Code 137)` in Kubernetes.
+
+**Symptom**: `Pod OOMKilled (Exit Code 137)` in Kubernetes or `java.lang.OutOfMemoryError: Java heap space` on executor.
 **Cause**: **Data Skew**. One partition is 10GB, while others are 100MB.
-*   **Mechanism**: The Executor tries to load the 10GB partition into "Execution Memory" for sorting/shuffling. It spills to disk, but if the metadata pointers alone exceed overhead, it crashes.
+
+#### The Mechanism
+
+**Spark's Memory Model**: Each executor has a fixed heap (e.g., 4GB).
+*   **Execution Memory**: Used for sorting/shuffling (60% of heap by default).
+*   **Storage Memory**: Used for caching (40% of heap).
+
+**The Problem**:
+1.  **GroupBy Key "user_123"**: 99% of data has `user_id = "user_123"`.
+2.  **Partitioning**: Spark hashes the key → All "user_123" data goes to **one partition**.
+3.  **Executor Assignment**: One executor gets a 10GB partition.
+4.  **Sorting/Aggregation**: Executor tries to sort 10GB in 2.4GB of Execution Memory.
+5.  **Spill to Disk**: Spark spills to disk, but metadata overhead (pointers, index) still consumes heap.
+6.  **OOM**: Heap exhausted → Process killed.
 
 ```mermaid
 graph TD
-    P1["Partition 1 (100MB)"] --> E1["Executor 1 (Safe)"]
-    P2["Partition 2 (10GB!)"] --> E2["Executor 2 (OOM Crash)"]
+    P1["Partition 1 (100MB)"] --> E1["Executor 1<br/>(Memory: 4GB)<br/>Status: OK"]
+    P2["Partition 2 (10GB!)<br/>user_123 skew"] --> E2["Executor 2<br/>(Memory: 4GB)<br/>Sorting 10GB > 2.4GB<br/>OOMKilled!"]
+    
+    style E1 fill:#ccffcc
     style E2 fill:#ff9999
 ```
 
+#### The Fix
+
+**Option 1: Salting (Add Random Suffix)**
+```scala
+// Add random suffix to skewed key
+val saltedDF = df.withColumn("salted_key", 
+    concat(col("user_id"), lit("_"), (rand() * 10).cast("int")))
+
+// GroupBy on salted key (distributes across 10 partitions)
+val result = saltedDF.groupBy("salted_key").agg(sum("amount"))
+
+// Remove salt and re-aggregate
+val final = result.withColumn("user_id", split(col("salted_key"), "_")(0))
+    .groupBy("user_id").agg(sum("sum(amount)"))
+```
+
+**Option 2: Increase Executor Memory**
+```
+--executor-memory 16g
+```
+
+**Option 3: Increase Partitions**
+```scala
+spark.conf.set("spark.sql.shuffle.partitions", 1000)  // Default is 200
+```
+
+---
+
 ### Scenario D: The Serialization Trap
-**Symptom**: `java.io.NotSerializableException`
-**Cause**: Accessing a non-serializable object (like a socket or DB connection) inside a `map()` function.
-*   **Mechanism**: Spark must **Serialize** the code (Closure) on the Driver to send it to the Executor. If the closure references an open connection, serialization fails because connections are tied to the machine's OS handle.
-*   **The Fix**: Create the connection *inside* `mapPartitions()`, not on the Driver.
+
+**Symptom**: `java.io.NotSerializableException: some.package.MyClass`.
+**Cause**: Accessing a non-serializable object (like a DB connection) inside a `map()` function.
+
+#### The Mechanism
+
+Spark must **serialize closures** (the code inside `map/filter/etc`) on the Driver and send them to Executors.
+
+**The Problem**:
+```scala
+// BAD: Connection created on Driver (not serializable)
+val connection = new DatabaseConnection()  // Lives on Driver
+
+df.map(row => {
+    connection.query(row.getString(0))  // ERROR: connection not serializable!
+})
+```
+
+**Why It Fails**: The closure captures `connection`. Spark tries to serialize `connection` to send it to executors, but database connections hold OS-level resources (sockets, file descriptors) that cannot be serialized.
+
+#### The Fix
+
+**Option 1: Create Connection Inside `mapPartitions`**
+```scala
+df.mapPartitions(partition => {
+    // Create connection INSIDE the executor (not serialized)
+    val connection = new DatabaseConnection()
+    
+    val results = partition.map(row => {
+        connection.query(row.getString(0))
+    })
+    
+    connection.close()
+    results
+})
+```
+
+**Option 2: Use Broadcast Variables (for read-only objects)**
+```scala
+val configBroadcast = spark.sparkContext.broadcast(config)
+
+df.map(row => {
+    val localConfig = configBroadcast.value  // Deserialize on executor
+    processRow(row, localConfig)
+})
+```
+
+---
 
 ---
 

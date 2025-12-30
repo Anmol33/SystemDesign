@@ -96,7 +96,9 @@ graph TD
 
 ### B. The Radix Tree Structure
 
-The Radix Tree (Rax) is a **compressed prefix tree**:
+The Radix Tree (Rax) is a **compressed prefix tree** that stores Entry IDs efficiently.
+
+**Components**:
 *   **Keys**: Entry IDs (e.g., `1700000000000-0`).
 *   **Values**: Pointers to serialized field-value pairs.
 *   **Compression**: Common prefixes are compressed (e.g., if 1000 entries start with `1700000000`, that prefix is stored once).
@@ -110,11 +112,109 @@ typedef struct stream {
 } stream;
 ```
 
+#### Visual Example: How Prefix Compression Works
+
+Let's say we have 5 entries with these IDs:
+*   `1700000000000-0`
+*   `1700000000001-0`
+*   `1700000000002-0`
+*   `1700000000003-0`
+*   `1700000050000-0`
+
+**Without Compression (Standard Tree)**:
+Each entry stores the full ID → **5 × 17 bytes = 85 bytes** (just for keys).
+
+**With Radix Tree Compression**:
+```mermaid
+graph TD
+    Root["Root"] --> Prefix["1700000000<br/>(Common Prefix)"]
+    
+    Prefix --> Branch1["000-0<br/>→ Entry 1 Data"]
+    Prefix --> Branch2["001-0<br/>→ Entry 2 Data"]
+    Prefix --> Branch3["002-0<br/>→ Entry 3 Data"]
+    Prefix --> Branch4["003-0<br/>→ Entry 4 Data"]
+    Prefix --> Branch5["050000-0<br/>→ Entry 5 Data"]
+    
+    style Prefix fill:#ccffcc
+    style Branch1 fill:#e6f3ff
+    style Branch2 fill:#e6f3ff
+    style Branch3 fill:#e6f3ff
+    style Branch4 fill:#e6f3ff
+    style Branch5 fill:#e6f3ff
+```
+
+**Storage**:
+*   **Common prefix** `1700000000` stored once: **10 bytes**.
+*   **Suffixes**: `000-0`, `001-0`, `002-0`, `003-0`, `050000-0`: **5-6 bytes each**.
+*   **Total**: ~10 + (5 × 6) = **40 bytes** (vs 85 bytes).
+
+**Memory Savings**: ~53% reduction just on keys!
+
+#### Real-World Impact
+
+**Scenario**: 100,000 entries added in 1 second (same millisecond timestamp `1700000000000`).
+*   **All share prefix**: `1700000000000-`
+*   **Only suffix varies**: `-0`, `-1`, `-2`, ... `-99999`.
+
+**Radix Tree Storage**:
+*   Prefix stored once: 13 bytes.
+*   100,000 unique suffixes: ~1-6 bytes each.
+*   **Total Key Storage**: ~600KB (vs 1.7MB uncompressed).
+
+This is why Streams can hold **10x more entries** than standard Redis Lists in the same RAM.
+
 ### C. Consumer Groups vs Kafka
 
 #### Kafka: The "Offset" Model
 *   **State**: Stored as a single integer (Offset 500).
 *   **Meaning**: "I have processed everything up to 500."
+*   **Weakness**: If Consumer A crashes at offset 502, the whole group is blocked or messages are lost.
+
+**The Problem Explained**:
+
+In Kafka, the consumer group tracks a **single committed offset** per partition. This creates a critical issue when a consumer crashes mid-processing.
+
+**Scenario**:
+1.  Consumer A fetches messages 500-509 (batch of 10).
+2.  Consumer A processes messages 500, 501 successfully.
+3.  Consumer A crashes while processing message 502.
+4.  **Last committed offset**: 500 (because Consumer A never committed 501-509).
+
+**What Happens Next?**
+
+```mermaid
+graph TD
+    Partition["Kafka Partition<br/>Messages 500-509"] --> Fetch["Consumer A Fetches<br/>500-509"]
+    Fetch --> Process["Process 500, 501<br/>(Success)"]
+    Process --> Crash["CRASH<br/>(at offset 502)"]
+    
+    subgraph Decision["The Dilemma"]
+        Option1["Option 1: Reprocess from 500<br/>(Duplicate 500, 501)"]
+        Option2["Option 2: Skip ahead to 510<br/>(Lose 502-509)"]
+    end
+    
+    Crash --> Decision
+    
+    style Crash fill:#ff9999
+    style Option1 fill:#fff3cd
+    style Option2 fill:#fff3cd
+```
+
+**The Two Bad Choices**:
+
+1.  **Reprocess from last committed offset (500)**:
+    *   Consumer B (or restarted A) reads from offset 500.
+    *   Messages 500-501 are **duplicated** (processed twice).
+    *   *Best Practice*: Use idempotent processing to handle duplicates.
+
+2.  **Skip ahead (if using `enable.auto.commit=true` and it committed mid-batch)**:
+    *   If auto-commit happened after fetching but before crash, offset might be 510.
+    *   Messages 502-509 are **lost** (never processed).
+    *   *This is data loss.*
+
+**Why "Blocked"?**
+
+If the partition is assigned exclusively to Consumer A (which crashed), and the consumer group waits for a rebalance timeout before reassigning, the partition sits idle during this window → throughput drops to zero for that partition.
 *   **Weakness**: If Consumer A crashes at offset 502, the whole group is blocked or messages are lost.
 
 #### Redis Streams: The "PEL" (Pending Entries List) Model

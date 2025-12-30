@@ -1,9 +1,11 @@
 # 03. Apache Kafka: The Distributed Commit Log
 
 ## 1. Introduction
-Apache Kafka is a distributed event streaming platform designed for **High Throughput**, **Fault Tolerance**, and **Replayability**. Unlike traditional queues, it functions as a **Distributed Commit Log**: an append-only, immutable sequence of records.
+Apache Kafka is a distributed event streaming platform designed for **High Throughput**, **Fault Tolerance**, and **Replayability**. Unlike traditional message brokers, it functions as a **Distributed Commit Log**: an append-only, immutable sequence of records.
 
-It is the industry standard for building real-time data pipelines and streaming applications.
+It is the industry standard for building real-time data pipelines, stream processing applications, and event-driven architectures.
+
+**Key Differentiator**: Messages are **not deleted** after consumption. They persist for a configured retention period, enabling replay and multiple independent consumers.
 
 ---
 
@@ -14,118 +16,130 @@ Kafka's scalability comes from its partitioning model.
 ```mermaid
 graph TD
     subgraph CP["Control Plane"]
-        ZK[Zookeeper / KRaft Quorum]
+        ZK["Zookeeper / KRaft Quorum"]
         Controller["Broker 1 (Active Controller)"]
     end
-
+    
     subgraph DP["Data Plane"]
-        Node2[Broker 2]
-        Node3[Broker 3]
+        Node2["Broker 2"]
+        Node3["Broker 3"]
     end
-
+    
     ZK <-->|Metadata Sync| Controller
     Controller -->|Leader Election| Node2
     Controller -->|Leader Election| Node3
-
-    Topic[Topic: UserEvents] --> P0["Partition 0 (Leader: Broker 1)"]
+    
+    Topic["Topic: UserEvents"] --> P0["Partition 0 (Leader: Broker 1)"]
     Topic --> P1["Partition 1 (Leader: Broker 2)"]
     Topic --> P2["Partition 2 (Leader: Broker 3)"]
 ```
 
 ### Key Components
-1.  **Topic**: A logical category of messages (e.g., `logs`, `transactions`).
+1.  **Topic**: A logical category of messages (e.g., `user-events`, `transactions`).
 2.  **Partition**: The unit of parallelism. A topic is split into $N$ partitions.
-3.  **Offset**: A unique integer ID identifying a message's position in the partition.
+3.  **Offset**: A unique integer ID identifying a message's position in the partition (starts at 0, increments sequentially).
 4.  **Consumer Group**: A set of consumers working together. Kafka assigns each partition to exactly one consumer in the group.
+5.  **Controller**: One broker acts as the "brain", managing leader election and metadata propagation.
 
 ---
 
-## 3. Internal Mechanics
+## 3. How It Works: The Partition Model
+
+### A. Producers Choose Partitions
+When publishing, producers use a **partitioning strategy**:
+*   **Key-based**: `hash(key) % num_partitions` (guarantees same key goes to same partition → ordering).
+*   **Round-robin**: If no key, distribute evenly.
+
+### B. Consumer Groups & Partition Assignment
+*   **Rule**: Each partition is assigned to **exactly one** consumer in a group.
+*   **Parallelism**: If you have 10 partitions and 10 consumers in a group, each consumer gets 1 partition.
+*   **Under-subscribed**: 10 partitions, 3 consumers → Some consumers get multiple partitions.
+*   **Over-subscribed**: 10 partitions, 20 consumers → 10 consumers sit idle.
+
+---
+
+## 4. Deep Dive: Internal Implementation
 
 ### A. Sequential I/O & Page Cache
+
 Kafka relies on the physics of disk drives.
-*   **Design**: It purely **appends** to files.
-*   **Benefit**: Sequential Write/Read on HDD/SSD is fast. Random Access is slow.
-*   **Caching**: Kafka does not cache data in JVM heap. It relies on the **OS Page Cache**. This means free RAM on the Linux server is automatically used to cache the latest messages.
+*   **Design**: It **appends** to log files (no random writes).
+*   **Benefit**: Sequential Write/Read on HDD/SSD is fast (100MB/s+). Random access is slow (1MB/s).
+*   **Caching**: Kafka does not cache data in JVM heap. It relies on the **OS Page Cache**. Free RAM automatically caches recent messages.
+
+**Why This Matters**: You can achieve 1M+ messages/second on commodity hardware.
 
 ### B. Zero-Copy Optimization
-Kafka minimizes CPU cycles during network transfer.
-*   **Traditional**: Disk -> Kernel -> User Space -> Kernel -> Socket.
-*   **Kafka**: Application calls `sendfile()`. Disk -> Kernel Page Cache -> NIC.
-*   **Result**: Extremely high throughput (saturating 10Gbps+ links) with low CPU usage.
+
+Kafka minimizes CPU cycles during network transfer using `sendfile()` syscall.
+
+**Traditional Path** (4 copies):
+```
+Disk → Kernel Buffer → User Space (JVM) → Kernel Socket Buffer → NIC
+```
+
+**Kafka Path** (2 copies):
+```
+Disk → Kernel Page Cache → NIC
+```
+
+**Result**: Saturate 10Gbps+ links with low CPU usage.
 
 ### C. The Consumer Rebalancing Protocol
+
 When a consumer joins or leaves a group, the cluster triggers a **Rebalance**.
-1.  **Stop the World**: All consumers in the group stop reading.
-2.  **JoinGroup**: All send a request to the Group Coordinator (Broker).
-3.  **SyncGroup**: Leader assigns partitions to members.
-4.  **Resume**: Consumers start reading from the last committed offset.
-*   *Note*: Frequent rebalancing (due to unstable networks) is a common performance killer.
-
----
-
----
-
-## 4. The Cluster Controller & Metadata Overhead
-Why can't you just have 1 million partitions in a Kafka cluster? The answer usually lies in the **Controller Bottleneck**.
-
-### The Role of the Controller
-In a standard Kafka cluster (Pre-KRaft), exactly one Broker is elected as the **Controller**. Its job is to:
-1.  **Monitor Liveness**: Watch Zookeeper for broker failures.
-2.  **Elect Leaders**: When a broker dies, the Controller decides which replica becomes the new Leader for every affected partition.
-3.  **Propagate Metadata**: Push the new "State of the World" to all other brokers.
-
-### The Bottleneck: "Stop-the-World" Loading
-When a Controller fails, the *new* Controller must:
-1.  Read the metadata for **ALL** partitions from Zookeeper.
-2.  Compute the new state.
-3.  Send requests to every broker.
 
 ```mermaid
 sequenceDiagram
-    participant ZK as Zookeeper
-    participant Old as "Controller (Old)"
-    participant New as "Controller (New)"
-    participant Broker as "Brokers (x100)"
+    participant C1 as Consumer 1
+    participant C2 as Consumer 2 (New)
+    participant GC as Group Coordinator<br/>(Broker)
     
-    Note right of Old: CRASHES
+    Note over C1: Processing Partition 0,1,2
     
-    ZK->>New: 1. Watch Trigger: Old Controller Gone
+    C2->>GC: JoinGroup Request
     
     rect rgb(255, 200, 200)
-        Note over New, ZK: "The Failover Window" (Cluster Unstable)
-        New->>ZK: 2. READ ALL METADATA (500k Partitions)
-        ZK-->>New: Huge Payload (GBs)
-        Note right of New: Processing... (High Latency)
-        New->>Broker: 3. UpdateMetadataRequest (Stop the World)
+        Note over C1,GC: "Stop the World" (All consumers pause)
+        C1->>GC: JoinGroup Request
+        GC->>C1: SyncGroup (assign partitions)
+        GC->>C2: SyncGroup (assign partitions)
     end
     
-    Note over Broker: Cluster Recovered
+    Note over C1: Resumes with Partition 0,1
+    Note over C2: Starts Partition 2
 ```
 
-If you have 500,000 partitions, loading this metadata from Zookeeper is linear and slow.
-*   **The Impact**: During this failover (which can take minutes), the cluster cannot handle administrative changes, and "unclean" shutdowns can trigger massive rebuild storrms.
+**Steps**:
+1.  **Stop the World**: All consumers in the group stop reading.
+2.  **JoinGroup**: All send a request to the Group Coordinator (a Broker).
+3.  **SyncGroup**: One consumer (leader) assigns partitions to members.
+4.  **Resume**: Consumers start reading from the last committed offset.
 
-### The Solution: KRaft (Roaring new Architecture)
-Modern Kafka (2.8+) removes Zookeeper entirely. The Controller is no longer a "State-Less Processor that needs to load state"; it is a **State-Full Raft Member**.
+**Performance Note**: Frequent rebalancing (due to unstable networks or long GC pauses) kills throughput.
 
-#### Under the Hood: The Mechanics of KRaft
-You asked: *"Does it have a local DB?"* and *"How does it finalize everything?"* Here is the detailed answer.
+### D. The Controller: Cluster Brain
 
-1.  **The Metadata Topic (`@metadata`)**:
-    *   Yes, this is an internal Kafka topic.
-    *   **Single Partition**: It typically has only **1 Partition**. Why? Because total ordering of cluster events is required. You cannot compromise consistency for parallelism here.
-    *   **The Log**: It contains events like `RegisterBroker(ID=1)`, `CreateTopic(Name=UserEvents)`, `IsrChange(Partition=0, NewISR=[1,2])`.
+In Kafka, exactly one Broker is elected as the **Controller**. Its job:
+1.  **Monitor Liveness**: Watch for broker failures.
+2.  **Elect Leaders**: When a broker dies, decide which replica becomes the new Leader for affected partitions.
+3.  **Propagate Metadata**: Push the new "State of the World" to all brokers.
 
-2.  **The State Machine (Log Replay)**:
-    *   Every Controller (Active & Standby) treats this log as the "Source of Truth".
-    *   They run a **State Machine** in memory. By replaying every message in the log from Offset 0 to Infinity, they build the current state of the cluster in RAM.
-    *   *Analogy*: It's like replaying a bank ledger to get the final account balance.
+#### The Zookeeper Problem (Pre-KRaft)
+When a Controller fails, the *new* Controller must:
+1.  Read metadata for **ALL** partitions from Zookeeper (O(partitions)).
+2.  Compute new state.
+3.  Send requests to every broker.
 
-3.  **The "Local DB" (Snapshots)**:
-    *   **Problem**: Replaying a log with 100 million events takes too long.
-    *   **Solution**: Kafka periodically dumps its in-memory state to a **Snapshot File** (`.checkpoint`).
-    *   **Optimization**: When a Controller starts, it loads the latest Snapshot (e.g., state at Offset 10,000) and then only replays the log from Offset 10,001. This Snapshot file *is* effectively the local database.
+**Bottleneck**: With 500k partitions, this "Stop-the-World" loading takes minutes.
+
+#### The KRaft Solution (Kafka 2.8+)
+Modern Kafka removes Zookeeper entirely. The Controller is a **Stateful Raft Member**.
+
+**How It Works**:
+1.  **`@metadata` Topic**: A single-partition internal log storing all cluster events (`CreateTopic`, `RegisterBroker`, `IsrChange`).
+2.  **State Machine**: Controllers replay this log to build cluster state in RAM.
+3.  **Snapshots**: Periodic dumps (`state.checkpoint`) enable fast recovery (load snapshot + replay recent log).
 
 ```mermaid
 sequenceDiagram
@@ -148,45 +162,15 @@ sequenceDiagram
     Note right of Standby: Recovered!
 ```
 
-#### 1 Million Partitions?
-**Yes.** Because the failover cost is almost zero (no "Stop-the-World" loading), KRaft clusters can support **1 Million+ Partitions** stable.
-*   *Note*: You still need enough RAM on brokers to hold the partition indices, but the administrative bottleneck is gone.
+**Result**: KRaft clusters can support **1 Million+ Partitions** stably (vs 200k with Zookeeper).
 
 ---
 
-## 5. Scaling Kafka: Global & Horizontal
+## 5. End-to-End Walkthrough: Life and Death in a Cluster
 
-### A. Horizontal Scaling
-*   **Broker Expansion**: Add new nodes to the cluster.
-*   **Partition Reassignment**: Use the `kafka-reassign-partitions.sh` tool to move existing partitions to the new nodes. (This consumes network bandwidth).
+Let's trace a 3-node cluster through normal operation and failures.
 
-### B. Global Geo-Replication (MirrorMaker 2)
-Kafka clusters are effectively local to a region due to latency requirements (ISR - In-Sync Replicas).
-*   **Cross-Region Strategy**:
-    *   Cluster A (US-East)
-    *   Cluster B (EU-West)
-*   **MirrorMaker 2 (MM2)**: A specialized Connect cluster that works as a consumer on A and producer on B.
-    *   **Active-Passive**: Disaster Recovery.
-    *   **Active-Active**: Bi-directional sync (requires handling infinite routing loops).
-
----
-
-## 6. Constraints & Limitations
-
-| Constraint | Limit | Why? |
-| :--- | :--- | :--- |
-| **Total Partitions** | ~200k (ZK) / 1M (KRaft) | Metadata overhead on the Controller (See Section 4). |
-| **Message Size** | < 1MB (Recommended) | Kafka is throughput-optimized. Huge blobs block the network threads. |
-| **Retention** | Disk Bound | You can only store as much as your disk allows. Tiered Storage (S3) is solving this. |
-| **Ordering** | Partition Scope Only | Global ordering across a topic is impossible without sacrificing parallelism. |
-
----
-
-## 7. End-to-End Walkthrough: Life and Death in a Cluster
-
-Let's trace a real-world scenario to cement these concepts.
-
-### 1. The Setup
+### Setup
 *   **Cluster**: 3 Brokers (Node 1, Node 2, Node 3).
 *   **Topic**: `UserEvents` (3 Partitions, Replication Factor 3).
 *   **Controller**: Node 1.
@@ -197,20 +181,19 @@ Let's trace a real-world scenario to cement these concepts.
 | **P1** | **Node 2** | Node 3 | Node 1 |
 | **P2** | **Node 3** | Node 1 | Node 2 |
 
----
+### Scenario A: The Worker Dies (Node 2 Crashes)
 
-### 2. Scenario A: The Worker Dies (Node 2 Crashes)
-**Event**: Node 2 pulls the power plug.
+**Event**: Node 2 loses power.
 
-1.  **Detection**: Node 1 (Controller) notices Node 2 missed its Zookeeper heartbeat / KRaft Pulse.
-2.  **Impact Analysis**:
+1.  **Detection**: Node 1 (Controller) notices Node 2 missed heartbeat.
+2.  **Impact**:
     *   **P1** lost its Leader.
     *   **P0 & P2** lost a Follower.
 3.  **Action (Controller)**:
-    *   Elects **Node 3** as new Leader for **P1** (because Node 3 is in ISR).
+    *   Elects **Node 3** as new Leader for **P1** (it's in ISR).
     *   Shrinks ISR for P0 & P2 to `{1, 3}`.
 4.  **Result**:
-    *   Producers writing to P1 now send data to Node 3.
+    *   Producers writing to P1 now send to Node 3.
     *   Cluster is "Under Replicated" but **100% Available**.
 
 ```mermaid
@@ -219,40 +202,294 @@ graph TD
         P1["Partition 1"] -->|Leader| N2["Node 2"]
         P1 -.->|Follower| N3["Node 3"]
     end
-
+    
     subgraph S2["Step 2: Node 2 Dies"]
         N2_Dead["Node 2 (CRASHED)"]
     end
-
+    
     subgraph S3["Step 3: Recovery"]
         P1_Rec["Partition 1"] -->|New Leader| N3_Rec["Node 3"]
     end
-
+    
     P1 --> N2_Dead
     N2_Dead --> P1_Rec
     
     style N2_Dead fill:#ff9999
 ```
 
----
+### Scenario B: The Controller Dies (Node 1 Crashes)
 
-### 3. Scenario B: The Controller Dies (Node 1 Crashes)
 **Event**: Node 1 (The Controller) crashes.
 
-1.  **Detection**: The ZK/KRaft Quorum detects Node 1 is gone.
+1.  **Detection**: ZK/KRaft Quorum detects Node 1 is gone.
 2.  **Action (Control Plane)**:
-    *   **New Controller Election**: Node 3 wins the election.
-    *   **State Recovery**: Node 3 reads `@metadata` (Instant in KRaft) to know the partition layout.
+    *   **Election**: Node 3 wins controller election.
+    *   **State Recovery**: Node 3 reads `@metadata` (instant in KRaft).
 3.  **Action (Data Plane)**:
     *   Node 3 sees P0 lost its leader (Node 1).
-    *   Node 3 elects **Node 2** (if it recovered) or itself as new Leader for P0.
-4.  **Result**: Cluster resumes normal operation with Node 3 as the Brain.
+    *   Elects **Node 2** as new Leader for P0.
+4.  **Result**: Cluster resumes normal operation with Node 3 as the brain.
 
 ---
 
-## 8. Production Checklist
+## 6. Failure Scenarios (The Senior View)
 
-1.  [ ] **Use Random Partition Keys? No.** Use a semantic key (`UserId`) to ensure ordering for that entity.
-2.  [ ] **Tuning `min.insync.replicas`**: Set to `2` (with `acks=all`) to guarantee no data loss if a node dies.
-3.  [ ] **Avoid `unclean.leader.election`**: Set to `false`. Better to go down than to serve corrupt/old data.
-4.  [ ] **Monitor Consumer Lag**: The most critical metric. If Lag grows, you are falling behind.
+### Scenario A: The Consumer Crash (Offset Management)
+
+**Symptom**: Messages are either duplicated or lost after a consumer crashes.
+**Cause**: The offset commit happened at the wrong time relative to processing.
+
+#### The Mechanics of Offset Commits
+
+Kafka consumers must **commit offsets** to tell the broker "I've successfully processed up to here."
+
+**The Critical Question**: When do you commit?
+
+```mermaid
+sequenceDiagram
+    participant K as Kafka Partition
+    participant C as Consumer A
+    participant State as Offset Store
+    
+    K->>C: Fetch(500-509)
+    Note right of C: Batch of 10 messages
+    
+    rect rgb(200, 230, 255)
+        Note over C: Option 1: Commit BEFORE Processing
+        C->>State: Commit Offset 510
+    end
+    
+    C->>C: Process 500 (Success)
+    C->>C: Process 501 (Success)
+    
+    rect rgb(255, 200, 200)
+        Note over C: CRASH at 502
+    end
+    
+    Note over State: Offset = 510<br/>(Messages 502-509 LOST!)
+```
+
+#### Scenario A1: Commit-Then-Process (Data Loss)
+
+**Steps**:
+1.  Consumer fetches messages 500-509.
+2.  Consumer **commits offset 510** (marking all as processed).
+3.  Consumer processes 500, 501 successfully.
+4.  Consumer **crashes** at 502.
+
+**Result**:
+*   **Committed offset**: 510 (already saved).
+*   **Actual progress**: Only 500-501 processed.
+*   **Messages 502-509**: **LOST** (never processed, but marked as done).
+
+**When This Happens**: Using `enable.auto.commit=true` with default `auto.commit.interval.ms=5000` (auto-commits every 5 seconds, regardless of processing state).
+
+#### Scenario A2: Process-Then-Commit (Duplicates)
+
+```mermaid
+sequenceDiagram
+    participant K as Kafka Partition
+    participant C as Consumer A
+    participant State as Offset Store
+    
+    K->>C: Fetch(500-509)
+    
+    C->>C: Process 500 (Success)
+    C->>C: Process 501 (Success)
+    
+    rect rgb(255, 200, 200)
+        Note over C: CRASH at 502<br/>(Before Commit)
+    end
+    
+    Note over State: Offset = 500<br/>(Last committed)
+    
+    rect rgb(200, 255, 200)
+        Note over C: Consumer B Restarts
+        C->>K: Resume from 500
+        C->>C: Process 500 AGAIN (Duplicate)
+        C->>C: Process 501 AGAIN (Duplicate)
+        C->>State: Commit Offset 510
+    end
+```
+
+**Steps**:
+1.  Consumer fetches messages 500-509.
+2.  Consumer processes 500, 501 successfully.
+3.  Consumer **crashes** before committing offset.
+4.  New consumer (or restarted A) reads from **last committed offset (500)**.
+
+**Result**:
+*   **Messages 500-501**: **Duplicated** (processed twice).
+*   **Messages 502-509**: Processed correctly.
+
+**When This Happens**: Using `enable.auto.commit=false` with manual commit **after** a batch.
+
+**The Fix**: Implement **idempotent processing** (e.g., use unique transaction IDs, upsert operations).
+
+---
+
+### Scenario B: The Rebalance Storm
+
+**Symptom**: Consumers frequently disconnect/reconnect, processing stops periodically.
+**Cause**: Long GC pauses or network instability causing heartbeat timeouts.
+
+#### The Heartbeat Mechanism
+
+Consumers send heartbeats to the **Group Coordinator** (a Broker) to prove they're alive.
+
+**Key Configurations**:
+*   `session.timeout.ms` (default 10s): If no heartbeat for 10s, consumer is considered dead.
+*   `heartbeat.interval.ms` (default 3s): How often to send heartbeats.
+*   `max.poll.interval.ms` (default 5 minutes): Max time between `poll()` calls.
+
+**The Failure Cascade**:
+
+```mermaid
+sequenceDiagram
+    participant C1 as Consumer A
+    participant GC_Event as GC Pause
+    participant Coord as Group Coordinator
+    participant C2 as Consumer B
+    
+    C1->>Coord: Heartbeat (t=0s)
+    C1->>Coord: Heartbeat (t=3s)
+    C1->>Coord: Heartbeat (t=6s)
+    
+    rect rgb(255, 200, 200)
+        Note over C1, GC_Event: FULL GC (15 seconds!)
+    end
+    
+    Note over Coord: No heartbeat for 10s<br/>Consumer A is DEAD
+    Coord->>C2: Trigger Rebalance
+    
+    rect rgb(255, 220, 200)
+        Note over C1,C2: All consumers PAUSE
+    end
+    
+    C1->>Coord: Heartbeat (t=21s, after GC)
+    Coord->>C1: You were removed!<br/>Trigger Rebalance AGAIN
+    
+    rect rgb(255, 220, 200)
+        Note over C1,C2: All consumers PAUSE AGAIN
+    end
+```
+
+**Result**: 
+*   Every GC pause > 10s triggers a rebalance.
+*   Rebalance = All consumers stop processing.
+*   If GC happens frequently → Throughput drops to near zero.
+
+**The Fix**:
+1.  **Increase `session.timeout.ms`** to 30s (allows for longer GC pauses).
+2.  **Tune JVM GC**: Use G1GC, increase heap size.
+3.  **Ensure stable network** (no packet loss).
+4.  **Monitor `max.poll.interval.ms`**: If processing takes > 5 minutes, increase this.
+
+---
+
+### Scenario C: The Poison Message
+
+**Symptom**: Consumer crashes repeatedly on the same message.
+**Cause**: Malformed JSON or logic bug causes unhandled exception.
+
+**Mechanism**:
+1.  Consumer reads offset 100 → Crashes (e.g., `JSONParseException`).
+2.  Restarts → Reads offset 100 again → Crashes.
+3.  Infinite loop.
+
+**The Fix**:
+
+**Option 1: Skip Bad Message**
+```java
+try {
+    processMessage(record);
+    consumer.commitSync();
+} catch (Exception e) {
+    logger.error("Poison message at offset " + record.offset(), e);
+    // Skip to next message
+    consumer.commitSync();
+}
+```
+
+**Option 2: Dead Letter Topic (Recommended)**
+```java
+KafkaProducer<String, String> dlqProducer = new KafkaProducer<>(dlqProps);
+
+try {
+    processMessage(record);
+    consumer.commitSync();
+} catch (Exception e) {
+    logger.error("Poison message at offset " + record.offset(), e);
+    
+    // Send to DLQ
+    ProducerRecord<String, String> dlqRecord = new ProducerRecord<>(
+        "dead-letter-queue",
+        record.key(),
+        record.value()
+    );
+    dlqRecord.headers().add("error", e.getMessage().getBytes());
+    dlqRecord.headers().add("original_topic", record.topic().getBytes());
+    dlqRecord.headers().add("original_offset", String.valueOf(record.offset()).getBytes());
+    
+    dlqProducer.send(dlqRecord);
+    
+    // Commit to skip
+    consumer.commitSync();
+}
+```
+
+---
+
+## 7. Scaling Strategies
+
+### A. Horizontal Scaling
+*   **Add Brokers**: New nodes join the cluster.
+*   **Reassign Partitions**: Use `kafka-reassign-partitions.sh` to move partitions to new brokers (network intensive).
+
+### B. Vertical Scaling
+*   **More Disk**: Increase retention capacity.
+*   **Faster Disks**: SSDs improve throughput.
+*   **More RAM**: OS Page Cache caches more messages.
+
+### C. Global Geo-Replication (MirrorMaker 2)
+Kafka clusters are regional due to ISR latency requirements.
+
+**Cross-Region Strategy**:
+*   **Cluster A** (US-East).
+*   **Cluster B** (EU-West).
+*   **MirrorMaker 2 (MM2)**: Consumer on A, Producer on B.
+*   **Modes**: Active-Passive (DR) or Active-Active (bidirectional).
+
+---
+
+## 8. Constraints & Limitations
+
+| Constraint | Limit | Why? |
+| :--- | :--- | :--- |
+| **Total Partitions** | ~200k (ZK) / 1M (KRaft) | Metadata overhead on Controller. |
+| **Message Size** | < 1MB (Recommended) | Huge blobs block network threads. |
+| **Retention** | Disk Bound | Can only store what fits on disk (Tiered Storage to S3 solving this). |
+| **Ordering** | Partition Scope Only | Global ordering impossible without sacrificing parallelism. |
+
+---
+
+## 9. When to Use Kafka?
+
+| Use Case | Verdict | Why? |
+| :--- | :--- | :--- |
+| **Event Sourcing** | **YES** | Immutable log is perfect for audit trails and replay. |
+| **Stream Processing** | **YES** | Kafka Streams / Flink integrate natively. |
+| **Real-time Analytics** | **YES** | High throughput, low latency. |
+| **Job Queues (Task Workers)** | **MAYBE** | Works, but RabbitMQ is better (per-message ACKs, complex routing). |
+| **Request-Reply (RPC)** | **NO** | Use gRPC or RabbitMQ. Kafka is for async workflows. |
+
+---
+
+## 10. Production Checklist
+
+1.  [ ] **Use Semantic Partition Keys**: Hash `user_id` (not random) to ensure ordering per entity.
+2.  [ ] **Set `min.insync.replicas=2`**: With `acks=all`, guarantees no data loss if one node dies.
+3.  [ ] **Disable `unclean.leader.election`**: Better to go down than serve corrupt/old data.
+4.  [ ] **Monitor Consumer Lag**: The most critical metric. If lag grows, you're falling behind.
+5.  [ ] **Use KRaft Mode**: Avoid Zookeeper complexity (Kafka 3.0+).
+6.  [ ] **Set Retention Based on Disk**: Calculate `retention.ms` based on throughput and disk size.
