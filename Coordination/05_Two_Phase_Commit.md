@@ -24,38 +24,44 @@
 2PC uses a **coordinator-participant** model where one node (coordinator) orchestrates the commit across multiple participants.
 
 ```mermaid
-graph TD
-    subgraph Distributed_Transaction["Distributed Transaction"]
-        Coordinator["Coordinator<br/>(Transaction Manager)"]
-        P1["Participant 1<br/>(Database A)"]
-        P2["Participant 2<br/>(Database B)"]
-        P3["Participant 3<br/>(Database C)"]
+sequenceDiagram
+    participant Client
+    participant Coord as Coordinator<br/>(Transaction Manager)
+    participant P1 as Participant 1<br/>(Database A)
+    participant P2 as Participant 2<br/>(Database B)
+    participant P3 as Participant 3<br/>(Database C)
+    
+    Client->>Coord: Begin Transaction
+    
+    rect rgb(200, 220, 255)
+        Note over Coord,P3: Phase 1: Prepare (Voting)
+        par Send Prepare to All
+            Coord->>P1: PREPARE
+            Coord->>P2: PREPARE
+            Coord->>P3: PREPARE
+        end
+        
+        P1-->>Coord: Vote: PREPARED ✅
+        P2-->>Coord: Vote: PREPARED ✅
+        P3-->>Coord: Vote: PREPARED ✅
     end
     
-    Client["Client"] -->|"Begin Transaction"| Coordinator
+    rect rgb(200, 255, 200)
+        Note over Coord,P3: Phase 2: Commit (Decision)
+        Coord->>Coord: All voted PREPARED<br/>→ Decision: COMMIT
+        
+        par Send Commit to All
+            Coord->>P1: COMMIT
+            Coord->>P2: COMMIT
+            Coord->>P3: COMMIT
+        end
+        
+        P1-->>Coord: ACK ✅
+        P2-->>Coord: ACK ✅
+        P3-->>Coord: ACK ✅
+    end
     
-    Coordinator -->|"Phase 1: Prepare"| P1
-    Coordinator -->|"Phase 1: Prepare"| P2
-    Coordinator -->|"Phase 1: Prepare"| P3
-    
-    P1 -.->|"Vote: PREPARED"| Coordinator
-    P2 -.->|"Vote: PREPARED"| Coordinator
-    P3 -.->|"Vote: PREPARED"| Coordinator
-    
-    Coordinator -->|"Phase 2: Commit"| P1
-    Coordinator -->|"Phase 2: Commit"| P2
-    Coordinator -->|"Phase 2: Commit"| P3
-    
-    P1 -.->|"ACK"| Coordinator
-    P2 -.->|"ACK"| Coordinator
-    P3 -.->|"ACK"| Coordinator
-    
-    Coordinator -->|"Transaction Complete"| Client
-    
-    style Coordinator fill:#e6ccff
-    style P1 fill:#e6f3ff
-    style P2 fill:#e6f3ff
-    style P3 fill:#e6f3ff
+    Coord->>Client: Transaction Complete ✅
 ```
 
 ### Key Components
@@ -178,7 +184,133 @@ Result: Coordinator sends ABORT to A
 
 **Outcome**: **Transaction aborted**. Safe because no commit decision was made.
 
-### B. Coordinator Fails After Prepare
+---
+
+### B. Participant Fails After Voting PREPARED (Before Receiving COMMIT)
+
+**Scenario**: Participant crashes after voting PREPARED but before receiving the COMMIT decision.
+
+**Why This is Different**: The participant voted YES, so the coordinator will decide COMMIT. But the participant is now down.
+
+#### The Problem
+
+```
+Timeline:
+t=0: Coordinator sends PREPARE to A, B, C
+t=1: A responds PREPARED ✅
+t=2: B responds PREPARED ✅
+t=3: C responds PREPARED ✅
+t=4: Coordinator decides COMMIT (all voted yes)
+t=5: Coordinator writes "COMMIT txn_123" to durable log ✅
+t=6: C CRASHES ❌ (before receiving COMMIT message)
+t=7: Coordinator sends COMMIT to A, B (successful)
+t=8: Coordinator tries to send COMMIT to C (fails - C is down)
+
+State:
+- Coordinator: Decided COMMIT ✅ (logged)
+- Participant A: Committed ✅
+- Participant B: Committed ✅
+- Participant C: Still in PREPARED state (crashed, holding locks) ❌
+```
+
+**Impact**: **Partial commit** - Some participants committed, one is down but will commit on recovery.
+
+---
+
+#### Recovery Mechanism
+
+**When Participant C Restarts**:
+
+```mermaid
+sequenceDiagram
+    participant C as Participant C<br/>(RESTARTED)
+    participant Coord as Coordinator
+    
+    rect rgb(255, 200, 200)
+        Note over C: Crash recovery started<br/>Found: txn_123 in PREPARED state
+    end
+    
+    C->>Coord: What was decision for txn_123?
+    
+    Coord->>Coord: Read transaction log<br/>Found: "COMMIT txn_123"
+    
+    Coord->>C: COMMIT txn_123
+    
+    rect rgb(200, 255, 200)
+        C->>C: Apply COMMIT<br/>Release locks<br/>Transaction complete
+    end
+    
+    Note over C,Coord: Consistency restored ✅
+```
+
+**Recovery Steps**:
+
+1. **C Discovers Incomplete Transaction**:
+   - On restart, C scans its transaction log
+   - Finds txn_123 in PREPARED state (not committed or aborted)
+   
+2. **C Contacts Coordinator**:
+   - Sends: "What was the decision for txn_123?"
+   
+3. **Coordinator Responds**:
+   - Reads durable log: "COMMIT txn_123"
+   - Sends: COMMIT to C
+   
+4. **C Applies Decision**:
+   - Commits the transaction
+   - Releases locks
+   - Marks txn_123 as COMPLETED
+
+**Alternative: Coordinator Proactive Retry**:
+```
+Coordinator detects C is back online
+Coordinator: "I have pending COMMIT for you: txn_123"
+C: Applies COMMIT ✅
+```
+
+---
+
+#### Why This is Safe
+
+**Critical Guarantee**: Once a participant votes PREPARED, it **MUST be able to commit**.
+
+**How Participant Guarantees This**:
+```
+When voting PREPARED, participant ensures:
+1. All constraints validated ✅
+2. Undo/redo logs written to disk ✅
+3. Locks acquired ✅
+4. Transaction can survive crash and be committed later ✅
+```
+
+**Durable Log on Coordinator**:
+```
+Coordinator's transaction log (durable):
+- PREPARE txn_123 (written at t=0)
+- COMMIT txn_123 (written at t=5)
+
+Even if coordinator crashes:
+→ On restart, reads log
+→ Knows to send COMMIT to any missing participants
+```
+
+---
+
+#### Comparison: Different Failure Timings
+
+| Failure Timing | Coordinator Decision | Outcome |
+|:---------------|:---------------------|:--------|
+| Before voting PREPARE | ABORT (didn't get all votes) | All abort ✅ |
+| **After voting PREPARED** | **COMMIT** (got all votes) | **Partial commit, recovery needed** ⚠️ |
+| After receiving COMMIT | COMMIT (normal) | All commit ✅ |
+
+**Key Difference**: 
+- Before voting: Safe to ABORT (participant can rollback)
+- After voting: Must COMMIT (participant promised it can)
+
+---
+
+### C. Coordinator Fails After Prepare
 
 **The Blocking Problem**:
 

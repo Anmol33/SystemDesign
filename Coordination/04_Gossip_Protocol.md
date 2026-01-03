@@ -57,15 +57,20 @@ graph TD
     style N7 fill:#fff3cd
 ```
 
-**After Multiple Rounds**:
+**After Multiple Rounds** (with fanout=2 per node):
 ```
-Round 0: 3 nodes have new state (v1)
-Round 1: 6 nodes have new state (infected 3 more)
-Round 2: 9 nodes have new state (infected 3 more)
-Round 3: 10 nodes have new state (fully propagated)
+Round 0: 3 nodes have new state (v1) - N1, N2, N3 (initial infected)
+Round 1: 8 nodes infected - N4, N5, N6, N7, N9 added (Nodes 8, 10 still behind)
+Round 2: 10 nodes - N8, N10 infected (full propagation)
 
-Result: O(log N) rounds to reach all nodes
+Result: O(log N) rounds to reach all nodes (exponential spread)
 ```
+
+**Why Exponential?**
+- Each infected node gossips to multiple peers (fanout)
+- Number of infected nodes roughly doubles/triples each round
+- 1 → 3 → 9 → 27 → 81 (grows exponentially)
+- For N=1000 nodes: ~log₂(1000) ≈ 10 rounds to full propagation
 
 ### Key Components
 
@@ -134,13 +139,88 @@ Problem: Network jitter causes false positives
 ```
 
 **Gossip Approach** (Phi Accrual):
-```
-Track heartbeat arrival times
-Calculate probability of failure (Phi value)
-Phi = 0-5: Likely alive
-Phi > 8: Likely dead (exponential scale)
 
-Adaptive: Tolerates network variance
+Instead of a binary timeout, Phi Accrual calculates a **suspicion level** that adapts to network conditions.
+
+**How It Works**:
+1. Track heartbeat arrival times (build history)
+2. Calculate mean and standard deviation of intervals  
+3. Compute Phi value: How much current delay deviates from expected
+4. If Phi > threshold (e.g., 8) → Declare node dead
+
+**Phi Formula** (simplified):
+```
+Phi(t) = -log₁₀(P(heartbeat arrives after time t))
+
+Higher Phi = Higher suspicion of failure
+Phi = 8 means 99.999999% confident node is dead
+```
+
+**Concrete Example 1: Stable Network**
+
+```
+Heartbeat History: t=0s, 1s, 2s, 3s, 4s, 5s, 6s, 7s, 8s, 9s
+Mean interval: 1.0 second
+Std deviation: 0.1 seconds (very stable!)
+
+Current time: t=11s (last heartbeat at t=9s)
+Delay: 2 seconds
+
+Analysis:
+- Expected: 1.0s ± 0.1s
+- Actual: 2s (10 standard deviations away!)
+- Phi ≈ 5.0 (suspicious but < 8)
+- Decision: Still ALIVE ✅
+
+At t=13s (delay=4s):
+- Phi ≈ 9.0 (exceeds threshold!)
+- Decision: Node declared DEAD ❌
+```
+
+**Concrete Example 2: Variable Network** (same delay, WAN with jitter)
+
+```
+Heartbeat History: t=0s, 1.2s, 2.8s, 3.5s, 5.1s, 6.8s, 7.3s, 9.0s, 10.5s
+Mean interval: 1.5 seconds
+Std deviation: 0.8 seconds (high variance!)
+
+Current time: t=15s (last heartbeat at t=10.5s)
+Delay: 4.5 seconds
+
+Analysis:
+- Expected: 1.5s ± 0.8s
+- Actual: 4.5s (3.75 standard deviations)
+- Phi ≈ 3.0 (not suspicious given variance)
+- Decision: Still ALIVE ✅
+```
+
+**Key Insight**: Same 4.5s delay, different outcomes:
+- Stable network: Phi ≈ 9.0 → DEAD ❌
+- Variable network: Phi ≈ 3.0 → ALIVE ✅
+
+**Phi adapts to each node's network characteristics!**
+
+**Phi Scale**:
+
+| Phi Value | Confidence | Action |
+|:----------|:-----------|:-------|
+| 0-2 | Alive ✅ | None |
+| 3-5 | Probably alive ✅ | None |
+| 6-7 | Getting suspicious ⚠️ | Monitor |
+| **8+** | **Very likely dead** | **Mark DOWN** ❌ |
+| 10+ | Almost certain | Remove from cluster |
+
+**Benefits**:
+1. **Adaptive**: Adjusts to each node's network patterns automatically
+2. **Fewer False Positives**: Tolerates variance without false alarms
+3. **Tunable**: Adjust threshold based on tolerance (Cassandra default: 8)
+4. **Gradual**: Provides suspicion level, not just binary alive/dead
+
+**Real Configuration** (Cassandra):
+```yaml
+phi_convict_threshold: 8   # Default - balanced
+phi_convict_threshold: 12  # For variable networks (more tolerance)
+phi_convict_threshold: 6   # For stable networks (faster detection)
 ```
 
 **Phi Accrual Diagram**:
