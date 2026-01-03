@@ -80,15 +80,209 @@ graph TD
 
 **6. Watches**: Clients can set one-time triggers on znodes to get notified of changes.
 
-**7. Sessions**: Client maintains persistent TCP connection with session timeout (heartbeats).
+**7. Sessions**: Client maintains persistent TCP connection with session timeout (heartbeats every `sessionTimeout/3`, typically 10s for 30s timeout).
 
 ---
 
-## 3. How It Works: ZAB Protocol
+## 3. How It Works: Sessions, Znodes, and ZAB Protocol
+
+### A. Session Management and Heart beats (Node Liveness Detection)
+
+**How ZooKeeper Knows if a Node is Active:**
+
+ZooKeeper uses **session-based heartbeats** to detect node failures automatically.
+
+```mermaid
+sequenceDiagram
+    participant App as Application
+    participant ZK as ZooKeeper Server
+    
+    App->>ZK: Connect (sessionTimeout = 30s)
+    ZK-->>App: Session ID + timeout
+    
+    loop Every 10s (timeout/3)
+        App->>ZK: Heartbeat (ping)
+        ZK-->>App: ACK
+    end
+    
+    rect rgb(255, 200, 200)
+        Note over App: Process crashes / network failure
+    end
+    
+    Note over ZK: Wait 30s (no heartbeat received)
+    
+    rect rgb(255, 220, 200)
+        Note over ZK: Session EXPIRED<br/>Delete ephemeral znodes
+    end
+    
+    Note over ZK: Notify watchers<br/>(other clients watching these paths)
+```
+
+**Session Lifecycle**:
+
+1. **Connection**: Client connects to any ZooKeeper server
+2. **Session Created**: ZooKeeper assigns unique session ID and timeout
+3. **Heartbeats**: Client sends ping every `sessionTimeout/3` (e.g., every 10s for 30s timeout)
+4. **Session Active**: As long as heartbeats received, session  stays alive
+5. **Timeout**: If no heartbeat for `sessionTimeout` seconds → Session EXPIRED
+6. **Cleanup**: ZooKeeper automatically deletes all ephemeral znodes from expired session
+
+**Session States**:
+- `CONNECTING`: Initial connection attempt
+- `CONNECTED`: Active session, heartbeats flowing ✅
+- `DISCONNECTED`: Temporary network issue (session still valid, will retry)
+- `EXPIRED`: Timeout exceeded, ephemeral znodes deleted ❌
+
+**Example: Detecting Kafka Broker Failure**:
+```
+t=0:  Kafka broker crashes
+t=0:  ZooKeeper stops receiving heartbeats from broker's session
+t=30: Session timeout expires (30s default)
+t=30: ZooKeeper deletes /kafka/brokers/ids/0 (ephemeral node)
+t=30: Kafka controller's watch fires → Reassigns partitions
+
+Total detection time: 30 seconds
+```
+
+### B. Znode Types and Use Cases
+
+**Znode Type Summary**:
+
+| Type | Created When | Deleted When | Use Case |
+|------|--------------|--------------|----------|
+| **PERSISTENT** | Config deployment, app setup | Explicit `delete()` call | Configuration, metadata |
+| **EPHEMERAL** | Service starts, leader election | Session expires (node dies) | Service registration, leader election |
+| **PERSISTENT_SEQUENTIAL** | Queue operations, logs | Explicit delete | Task queues, audit logs |
+| **EPHEMERAL_SEQUENTIAL** | Lock acquisition, election | Session expires | Distributed locks, ordered elections |
+
+### C. Coordination Patterns: How Systems Use ZooKeeper
+
+This section demonstrates how distributed systems leverage ZooKeeper for common coordination tasks.
+
+#### Pattern 1: Configuration Management
+
+**Use Case**: Centralized configuration that updates live across distributed services.
+
+**Implementation Steps**:
+1. **Store Config**: DevOps creates a persistent znode `/config/database/connection-string` with the config data.
+2. **Initial Read**: Service reads the znode on startup to get current configuration.
+3. **Set Watch**: Service sets a watch on the config znode.
+4. **Receive Update**: When DevOps updates the config, ZooKeeper sends notification to watching services.
+5. **Re-read and Apply**: Service receives watch event, reads new config, and hot-reloads (e.g., reconnect DB pool).
+6. **Re-register Watch**: Service sets a new watch (watches are one-time triggers).
+
+**Key Characteristics**:
+- **Watch is one-time**: Must re-register after each notification
+- **Small data**: Config should be < 1 MB (typically few KB)
+- **No polling**: Push-based notifications eliminate constant polling
+
+**Real-World: Kafka Broker Configuration**
+```
+ZooKeeper stores Kafka broker configs:
+  Path: /config/brokers/1001
+  Data: {"max.connections": 100, "retention.ms": 86400000}
+
+Broker 1001 watches this path. When SRE updates:
+1. ZooKeeper notifies broker via watch
+2. Broker reads new config
+3. Broker applies changes without restart
+4. Broker re-registers watch
+```
+
+#### Pattern 2: Leader Election
+
+**Use Case**: Ensure only ONE controller/coordinator is active across N replicas.
+
+**Implementation Steps**:
+1. **Race to Create**: All replicas try to create ephemeral znode `/elections/controller` with their ID.
+2. **Winner Determination**: 
+   - **First to succeed** → Becomes leader, starts coordinator work
+   - **Others fail** → Get `NodeExistsException`, become followers
+3. **Watch Leader**: Followers set watch on `/elections/controller` to detect leader failure.
+4. **Leader Work**: Leader does coordination while maintaining session (heartbeats).
+5. **Automatic Failover**: If leader crashes:
+   - Session expires → Z ooKeeper deletes ephemeral znode
+   - Followers' watches fire
+   - Followers race again to create the znode (Step 1)
+
+**Why It's Safe**:
+- **Atomic Create**: ZooKeeper guarantees only ONE client succeeds
+- **Session Binding**: Ephemeral node automatically deleted on crash
+- **No Split-Brain**: Only one znode can exist at a time
+
+**Real-World: Kafka Controller Election**
+```
+Kafka Controller Election Flow:
+
+Initial State:
+- Brokers {0, 1, 2} all try: create("/kafka/controller", EPHEMERAL)
+- Broker 0 wins → Creates znode with data "0"
+- Brokers 1, 2 → Watch "/kafka/controller"
+
+Broker 0 dies:
+→ Session expires (30s timeout)
+→ ZooKeeper deletes "/kafka/controller"
+→ Brokers 1, 2 get watch notification
+→ Race again: Broker 1 wins
+→ Broker 1 becomes new controller
+
+Total failover time: ~30-35 seconds
+```
+
+#### Pattern 3: Service Discovery / Cluster Membership
+
+**Use Case**: Track which service instances are alive and available.
+
+**Service Registration Steps (Each Instance)**:
+1. **Create Parent**: Ensure parent path `/services/web` exists (persistent).
+2. **Register Self**: Create ephemeral sequential znode:
+   - Path: `/services/web/instance-` (ZK appends sequence number)
+   - Data: `"192.168.1.10:8080"` (instance endpoint)
+   - Returns: `/services/web/instance-0000000001`
+3. **Automatic Cleanup**: When instance crashes, session expires → znode auto-deleted.
+
+**Service Discovery Steps (Load Balancer)**:
+1. **Get All Instances**: Load balancer calls `getChildren("/services/web")`.
+2. **Read Endpoints**: For each child, read znode data to get endpoint.
+3. **Build Routing Table**: Populate backend pool with live instances.
+4. **Watch for Changes**: Set watch on `/services/web` to detect additions/removals.
+5. **Update on Notification**: When watch fires, re-fetch children and update routing table.
+
+**ZooKeeper State Example**:
+```
+/services/web/instance-0000000001 → "192.168.1.10:8080" (Session: 0xabc)
+/services/web/instance-0000000002 → "192.168.1.11:8080" (Session: 0xdef)
+/services/web/instance-0000000003 → "192.168.1.12:8080" (Session: 0x123)
+
+If instance-2 crashes:
+→ Session 0xdef expires (30s timeout)
+→ ZooKeeper deletes /services/web/instance-0000000002
+→ Load balancer's watch fires
+→ Load balancer re-fetches children, sees only instance-1 and instance-3
+→ Removes 192.168.1.11:8080 from routing pool
+
+Detection time: ~30 seconds
+```
+
+**Real-World: Apache Solr Cloud**
+```
+Solr uses ZooKeeper for cluster state:
+
+/solr/collections/logs/shards/shard1/replicas/
+  ├── core_node1 → {"node_name": "solr1:8983", "state": "active"}
+  ├── core_node2 → {"node_name": "solr2:8983", "state": "active"}
+  └── core_node3 → {"node_name": "solr3:8983", "state": "active"}
+
+Solr nodes watch this path. When a node dies:
+→ ZooKeeper removes its ephemeral replica znode
+→ Cluster rebalances queries to remaining nodes
+```
+
+### D. ZAB Protocol Mechanics
 
 ZooKeeper uses **ZAB (ZooKeeper Atomic Broadcast)** for consensus. ZAB is similar to Raft but optimized for ZooKeeper's read-heavy workload.
 
-### A. Data Model
+### E. Data Model
 
 **Hierarchical Namespace** (like a Unix file system):
 
@@ -118,7 +312,7 @@ ZooKeeper uses **ZAB (ZooKeeper Atomic Broadcast)** for consensus. ZAB is simila
 - **ACL**: Access control list
 - **Stat**: Metadata (creation time, modification time, children count)
 
-### B. Write Flow (ZAB Protocol)
+### F. Write Flow (ZAB Protocol)
 
 **2-Phase Commit**:
 
@@ -173,7 +367,7 @@ sequenceDiagram
 3. **ACK**: Followers write to transaction log, send ACK
 4. **Commit**: Leader commits when quorum ACKs, broadcasts commit
 
-### C. Read Flow
+### G. Read Flow
 
 **Reads from any server** (no consensus required):
 
@@ -189,7 +383,7 @@ graph LR
 
 **Trade-off**: Reads may return slightly stale data (eventual consistency). For **linearizable reads**, client can issue `sync()` first.
 
-### D. Leader Election (Fast Leader Election)
+### H. Leader Election (Fast Leader Election)
 
 **Triggers**: Leader crash, network partition, startup.
 
@@ -443,70 +637,64 @@ sessionTimeout = 30000  # 30 seconds (was 6 seconds)
 
 ---
 
-### Scenario C: Sequential Node Collision (Distributed Lock)
+### Scenario C: Thundering Herd (Distributed Lock)
 
-**Symptom**: Two clients think they acquired the lock simultaneously.
-**Cause**: Incorrect implementation of lock recipe.
+**Symptom**: Massive spike in CPU/Network when a lock is released.
+**Cause**: All N clients watching the parent node wake up simultaneously.
 
-#### Incorrect Implementation
+#### Incorrect Implementation (Thundering Herd)
 
 **Bad Pattern**:
 ```
-Client A: create(/lock/lock-0000000001, EPHEMERAL_SEQUENTIAL)
-Client B: create(/lock/lock-0000000002, EPHEMERAL_SEQUENTIAL)
+Client A: create(/lock/lock-01, EPHEMERAL_SEQUENTIAL)
+Client B: create(/lock/lock-02, EPHEMERAL_SEQUENTIAL)
+Client C: create(/lock/lock-03, EPHEMERAL_SEQUENTIAL)
+... 1000 clients ...
 
-Client A: getChildren(/lock) → Returns [lock-0000000001, lock-0000000002]
-Client A: I have the smallest node → I have the lock! ✅
+# Client B sees it's not first.
+# BAD: Client B watches parent /lock for ANY change
+zk.getChildren("/lock", watch=TRUE)
 
-Client B: getChildren(/lock) → Returns [lock-0000000001, lock-0000000002]
-Client B: I have the smallest node? NO → Wait...
-
-# But what if Client A crashes before processing?
-# Client A ephemeral node deleted
-# Client B checks again, now it has smallest node → Acquires lock ✅
+# Client C watches parent /lock
+zk.getChildren("/lock", watch=TRUE)
 ```
 
-**The Problem**: If Client A crashes between creating node and setting watch, Client B doesn't know to check again.
+**What Happens**:
+1. Client A releases lock (deletes `lock-01`).
+2. ZooKeeper sends `NodeChildrenChanged` event to **ALL 999 waiting clients**.
+3. All 999 clients wake up and send `getChildren("/lock")` to check if they are next.
+4. Only Client B succeeds. The other 998 go back to sleep.
+5. **Result**: Massive wasted resources (O(N) notifications).
 
-#### Correct Implementation
+#### Correct Implementation (Chain Watch)
 
 **Good Pattern**:
 ```mermaid
 sequenceDiagram
-    participant CA as Client A
-    participant CB as Client B
-    participant ZK as ZooKeeper
+    participant CA as Client A (lock-01)
+    participant CB as Client B (lock-02)
+    participant CC as Client C (lock-03)
     
-    CA->>ZK: create(/lock/child-, EPHEMERAL_SEQUENTIAL)
-    ZK->>CA: Created /lock/child-0000000001
+    Note over CA: Owner (lock-01)
     
-    CB->>ZK: create(/lock/child-, EPHEMERAL_SEQUENTIAL)
-    ZK->>CB: Created /lock/child-0000000002
+    Note over CB: I am lock-02.<br/>Predecessor is lock-01.
+    CB->>ZK: exists(/lock/lock-01, watch=TRUE)
     
-    CA->>ZK: getChildren(/lock)
-    ZK->>CA: [child-0000000001, child-0000000002]
+    Note over CC: I am lock-03.<br/>Predecessor is lock-02.
+    CC->>ZK: exists(/lock/lock-02, watch=TRUE)
     
-    Note over CA: I am smallest → Lock acquired ✅
+    Note over CA: Releases lock<br/>(delete lock-01)
     
-    CB->>ZK: getChildren(/lock)
-    ZK->>CB: [child-0000000001, child-0000000002]
+    ZK->>CB: Notify lock-01 deleted!
+    Note over CB: I am now owner!
     
-    Note over CB: I am NOT smallest<br/>Set watch on predecessor
-    
-    CB->>ZK: exists(/lock/child-0000000001, watch=TRUE)
-    
-    Note over CA: Processing work...
-    Note over CA: Delete /lock/child-0000000001
-    
-    ZK->>CB: Watch triggered! NodeDeleted
-    
-    CB->>ZK: getChildren(/lock)
-    ZK->>CB: [child-0000000002]
-    
-    Note over CB: Now I am smallest → Lock acquired ✅
+    Note over CC: (Does not receive specific notification yet)
 ```
 
-**Key**: Always watch the **predecessor** node, not the lock parent.
+**Key**: Watch **only the specific predecessor node** (O(1) notification).
+- If `lock-01` deleted → Only `lock-02` notified.
+- If `lock-02` deleted → Only `lock-03` notified.
+- **Linear scalability**.
 
 ---
 

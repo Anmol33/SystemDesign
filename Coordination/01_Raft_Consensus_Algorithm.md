@@ -131,108 +131,269 @@ stateDiagram-v2
 ### A. Term Numbers and Voting
 
 **Term as Logical Clock**:
-```
-Server A: Term 5 (Leader)
-Server B: Term 5 (Follower)
-Server C: Term 3 (Stale, must update)
+- Server A: Term 5 (Leader)
+- Server B: Term 5 (Follower)
+- Server C: Term 3 (Stale, must update)
+- **Rule**: Server rejects RPCs with term < current term
 
-Rule: Server rejects RPCs with term < current term
-```
+**Voting Process Steps**:
 
-**Voting Algorithm**:
-```python
-def on_request_vote(candidate_id, candidate_term, last_log_index, last_log_term):
-    # Reject if candidate's term is stale
-    if candidate_term < current_term:
-        return False
-    
-    # Update term if candidate is ahead
-    if candidate_term > current_term:
-        current_term = candidate_term
-        voted_for = None  # Reset vote
-    
-    # Vote if haven't voted yet AND candidate's log is up-to-date
-    if (voted_for is None or voted_for == candidate_id) and \
-       is_log_up_to_date(last_log_term, last_log_index):
-        voted_for = candidate_id
-        return True
-    
-    return False
+1. **Reject Stale Candidates**:
+   - If candidate's term < current term → Reject immediately
 
-def is_log_up_to_date(candidate_last_term, candidate_last_index):
-    # Candidate's log is up-to-date if:
-    # 1. Last term is greater, OR
-    # 2. Last term is same AND last index >= ours
-    my_last_term = log[-1].term
-    my_last_index = len(log) - 1
-    
-    if candidate_last_term > my_last_term:
-        return True
-    if candidate_last_term == my_last_term and candidate_last_index >= my_last_index:
-        return True
-    return False
-```
+2. **Update Term When Candidate is Ahead**:
+   - If candidate's term > current term → Update current term to match
+   - Reset the vote (haven't voted for anyone yet)
+   - **CRITICAL**: Even if you're the LEADER, step down to follower when seeing higher term
+
+3. **Cast Vote Based on Eligibility**:
+   - Only vote if: (haven't voted yet OR already voted for this candidate) AND
+   - Candidate's log is at least as up-to-date as yours
+   - If both conditions met → Grant vote
+
+**Determining if Candidate's Log is Up-to-Date**:
+
+1. **Compare Last Term**:
+   - If candidate's last log term > your last log term → Candidate is up-to-date ✅
+
+2. **If Terms Equal, Compare Length**:
+   - If candidate's last log term == your last log term AND
+   - Candidate's log length >= your log length → Candidate is up-to-date ✅
+
+3. **Otherwise**:
+   - Candidate's log is behind → Do NOT grant vote ❌
 
 ### B. Log Replication Mechanics
 
-**AppendEntries RPC**:
-```python
-class AppendEntriesRPC:
-    term: int                # Leader's term
-    leader_id: str           # Leader's ID
-    prev_log_index: int      # Index of log entry immediately preceding new ones
-    prev_log_term: int       # Term of prev_log_index entry
-    entries: List[LogEntry]  # Log entries to replicate (empty for heartbeat)
-    leader_commit: int       # Leader's commit index
+**AppendEntries RPC Contains**:
+- `term`: Leader's current term
+- `leader_id`: ID of the leader sending this request
+- `prev_log_index`: Index of log entry immediately before the new ones
+- `prev_log_term`: Term of the entry at prev_log_index
+- `entries`: Log entries to replicate (empty for heartbeat)
+- `leader_commit`: Leader's commit index
 
-def on_append_entries(rpc):
-    # Reject if leader's term is stale
-    if rpc.term < current_term:
-        return False
-    
-    # Recognize leader, reset election timer
-    current_leader = rpc.leader_id
-    reset_election_timer()
-    
-    # Check log consistency
-    if len(log) <= rpc.prev_log_index or \
-       log[rpc.prev_log_index].term != rpc.prev_log_term:
-        return False  # Log doesn't match
-    
-    # Append new entries (delete conflicting entries first)
-    for i, entry in enumerate(rpc.entries):
-        index = rpc.prev_log_index + 1 + i
-        if index < len(log):
-            if log[index].term != entry.term:
-                log = log[:index]  # Delete conflicting entry and all following
-        log.append(entry)
-    
-    # Update commit index
-    if rpc.leader_commit > commit_index:
-        commit_index = min(rpc.leader_commit, len(log) - 1)
-    
-    return True
-```
+**Follower's Steps When Receiving AppendEntries**:
+
+1. **Validate Leader's Term**:
+   - If leader's term < current term → Reject (leader is stale) ❌
+
+2. **Acknowledge Leader**:
+   - Recognize this node as the current leader
+   - Reset election timer (prevents starting unnecessary election)
+
+3. **Check Log Consistency**:
+   - Verify that the log entry at `prev_log_index` has term matching `prev_log_term`
+   - If log doesn't match → Reject (logs are inconsistent) ❌
+
+4. **Append New Entries**:
+   - For each entry to append:
+     - If an existing entry conflicts (same index, different term) → Delete that entry and all following it
+     - Append the new entry
+
+5. **Update Commit Index**:
+   - If leader's commit index > follower's commit index
+   - Update follower's commit index to min(leader_commit, last log index)
+
+6. **Return Success** ✅
 
 ### C. Commit Index Propagation
 
-**Leader Tracks Followers**:
-```python
-# Leader maintains for each follower:
-next_index[follower] = index of next log entry to send
-match_index[follower] = highest log entry known to be replicated
+**Leader Tracks Followers Using**:
 
-# After successful AppendEntries ACK from follower:
-match_index[follower] = last_appended_index
-next_index[follower] = last_appended_index + 1
+1. **For Each Follower, Maintain**:
+   - `next_index[follower]`: Index of next log entry to send to this follower
+   - `match_index[follower]`: Highest log entry known to be replicated on this follower
 
-# Commit rule: advance commit_index when majority have replicated
-for n in range(commit_index + 1, len(log)):
-    if log[n].term == current_term:  # Only commit entries from current term
-        if count(match_index >= n) >= quorum:
-            commit_index = n
-            apply_to_state_machine(log[commit_index])
+2. **After Successful AppendEntries ACK**:
+   - Update `match_index[follower]` = last appended index
+   - Update `next_index[follower]` = last appended index + 1
+
+3. **Commit Rule - Advance commit_index When**:
+   - For each log index from (current commit_index + 1) to (end of log):
+     - Check if entry's term == current term (only commit entries from current term)
+     - Count how many followers have replicated this entry (match_index >= n)
+     - If count >= quorum → Commit entry at index n
+     - Apply committed entry to state machine
+
+### D. Commit Index vs Applied Index
+
+**Understanding Two Important Indices**:
+
+In Raft, there are two separate indices that track different stages of log processing:
+
+1. **`commit_index`**: 
+   - Highest log entry that is **committed** (safe, durable, won't be lost)
+   - Entry is committed when replicated to majority
+   - Updates immediately when quorum is reached
+
+2. **`applied_index`**: 
+   - Highest log entry that has been **applied to the state machine**
+   - Entry is applied when actually executed (e.g., updating database, modifying data structures)
+   - Updates after commit, usually with some delay
+
+**Why They're Different:**
+
 ```
+Timeline of a Write Operation:
+
+t=1: Entry replicated to majority → commit_index = 5 ✅
+t=2: Entry applied to state machine → applied_index = 5 ✅
+     
+There's a gap because applying can be slower than committing!
+```
+
+**Example Scenario:**
+
+```
+Current Log: [1] [2] [3] [4] [5]
+
+commit_index = 5     (entries 1-5 are safe/durable)
+applied_index = 3    (only 1-3 executed by state machine)
+
+Gap: Entries 4-5 are committed but not yet applied
+```
+
+**Why the Gap Exists:**
+
+| Reason | Explanation |
+|:-------|:------------|
+| **Async Processing** | State machine processes entries in background to avoid blocking |
+| **Slow Operations** | Applying might involve disk I/O, database updates, complex computation |
+| **Batching** | State machine might batch multiple entries for efficiency |
+| **Performance** | Leader can commit faster than it can apply, improving throughput |
+
+**Safety Guarantee:**
+
+- **Committed but not applied** → Safe! Entry won't be lost, will eventually be applied ✅
+- **Applied but not committed** → **IMPOSSIBLE!** Never happens in Raft ❌
+
+**Key Rule**: `applied_index` ≤ `commit_index` (always)
+
+---
+
+### E. Processing Read-Only Queries (ReadIndex)
+
+**Problem**: Read-only queries don't modify state, so they don't need to be written to the log. However, **reading directly from state machine can return stale data**.
+
+**Why Stale Reads Happen**:
+
+**Scenario**: Leader is partitioned but doesn't know it yet
+- **Old Leader (isolated)**:
+  - Thinks it's still leader
+  - commit_index = 100
+  - Serves reads from stale state
+  
+- **New Leader (with majority)**:
+  - Elected in term 6
+  - commit_index = 105
+  - Has latest committed data
+  
+- **Problem**: If old leader serves reads without verification → Returns data from index 100 (STALE!) ❌
+
+---
+
+**Solution 1: Read Through Log (Too Expensive)**
+
+Treat every read as a write:
+
+1. Client sends: "Read X"
+2. Leader appends "Read X" to log (**disk write!**)
+3. Leader replicates to majority (full Raft consensus)
+4. **Each follower writes "Read X" to their log (disk I/O!)**
+5. Followers ACK after disk write completes
+6. Leader commits the read entry
+7. Leader applies to state machine and returns value
+
+**Guarantee**: Linearizable (always latest) ✅  
+**Problem**: Requires **full log replication with disk writes** for EVERY read (very slow!) ⚠️  
+**Typical Latency**: ~50ms (disk I/O bound)
+
+---
+
+**Solution 2: ReadIndex (Recommended by Paper)**
+
+Verify leadership without going through the log:
+
+1. Leader receives read request
+2. Leader records `readIndex` = current `commit_index` **(memory only, no disk!)**
+3. Leader sends **heartbeat** (empty AppendEntries, **no log entries!**)
+4. **Followers immediately ACK (no disk I/O needed!)**
+5. Wait for majority ACKs (proves still leader)
+6. Wait until `applied_index` >= `readIndex` (usually instant)
+7. Read from state machine and return
+
+**Guarantee**: Linearizable ✅  
+**Cost**: 1 network round-trip only (no disk I/O!)  
+**Typical Latency**: ~5-10ms (network only, **5-10x faster** than reading through log)
+
+**Key Difference**: The heartbeat doesn't carry log entries, so followers can ACK immediately without writing to disk!
+
+---
+
+**ReadIndex Steps in Detail**:
+
+1. **Record Current Commit Point**:
+   - Store `read_index` = current `commit_index`
+
+2. **Verify Leadership**:
+   - Send heartbeat (AppendEntries) to all followers
+   - Count ACKs received
+   - If ACKs >= quorum → Leadership confirmed ✅
+   - If ACKs < quorum → Return error (might be partitioned) ❌
+
+3. **Wait for State Machine to Catch Up**:
+   - Wait until `applied_index` >= `read_index`
+
+4. **Safe to Read**:
+   - Read value from state machine
+   - Return to client
+
+---
+
+**Why This Works**:
+
+**If leader gets majority ACKs**:
+- Leader is definitely current (not partitioned) ✅
+- No new leader could have been elected ✅
+- Data at readIndex is committed and won't be lost ✅
+
+**If leader cannot get majority**:
+- Leader might be partitioned ⚠️
+- Return error, client can retry with actual leader
+
+---
+
+**Example Timeline**:
+
+- **t=0**: Client → Leader: Read("config/db")
+- **t=1**: Leader: `readIndex = 100` (current commit_index)
+- **t=2**: Leader → Follower 1: Heartbeat  
+          Leader → Follower 2: Heartbeat
+- **t=3**: Follower 1 → Leader: ACK  
+          Follower 2 → Leader: ACK
+- **t=4**: Leader: Majority confirmed! (3/3 nodes)
+- **t=5**: Leader: Check `applied_index >= 100` ✅
+- **t=6**: Leader: Read from state machine
+- **t=7**: Leader → Client: "config/db = postgres:5432"
+
+**Total latency**: ~5-10ms (vs ~50ms for log-based read)
+
+---
+
+**Performance Comparison**:
+
+| Operation | Read Through Log | ReadIndex |
+|:----------|:----------------|:----------|
+| **Leader disk writes** | ✍️ Yes (append to log) | ❌ No |
+| **Follower disk writes** | ✍️ Yes (all followers) | ❌ No |
+| **Log operations** | Append, replicate, commit | ❌ None |
+| **What followers do** | Write "Read X" to log, then ACK | Immediately ACK heartbeat |
+| **Network round-trips** | 1 (but waiting for disk I/O) | 1 (network only) |
+| **Typical latency** | ~50ms (disk I/O bound) | ~5-10ms (network only) |
+| **Speedup** | Baseline | **5-10x faster** ⚡ |
+
+**Bottom Line**: Both approaches contact followers and wait for majority ACKs, but ReadIndex uses empty heartbeats (no log entries), so followers respond instantly without disk I/O!
 
 ---
 
@@ -450,58 +611,286 @@ sequenceDiagram
 
 ---
 
-### Scenario C: Log Divergence (Conflict Resolution)
+### Scenario C: Log Divergence (Committed vs Uncommitted Entries)
 
-**Symptom**: Follower's log conflicts with leader's log after leader crash.
-**Cause**: Previous leader crashed before replicating all entries.
+**Symptom**: Follower's log conflicts with leader's log after crashes.
+**Cause**: Leaders crash at different stages of commit process.
+
+#### Key Insight: Replicated ≠ Committed
+
+```
+Entry is REPLICATED: Stored on majority of nodes
+Entry is COMMITTED:  Replicated + leader applied to FSM + follower notified
+```
+
+**Commit Process:**
+1. Leader receives write, replicates to majority (REPLICATED)
+2. Leader applies to state machine, returns "OK" to client (COMMITTED)  
+3. Leader sends heartbeat with `leader_commit` (followers commit)
+
+**If leader crashes between steps, different outcomes occur.**
+
+---
+
+#### The Scenario
+
+**Initial State (Leader A, term 3)**:
+```
+Leader A:    [1:1] [2:1] [3:2] [4:3]  ← Entry [4:3] replicated to A+B
+Follower B:  [1:1] [2:1] [3:2] [4:3]  
+Follower C:  [1:1] [2:1] [3:2]        ← Missing [4:3]
+```
+
+**Case 1: Entry [4:3] NOT Committed**
+```
+A crashes before sending heartbeat → B's commit_index = 3 (doesn't know [4:3] committed)
+B becomes leader (term 4), adds [5:4]
+B crashes
+C becomes leader (term 5) by default, adds [4:5]
+
+When B recovers:
+Leader C:  [1:1] [2:1] [3:2] [4:5]
+B:         [1:1] [2:1] [3:2] [4:3] [5:4] ← CONFLICT
+
+C sends AppendEntries → B deletes [4:3] and [5:4], accepts [4:5]
+✅ SAFE: Client never got "OK" for [4:3]/[5:4], must retry
+```
+
+**Case 2: Entry [4:3] IS Committed**
+```
+A sends heartbeat → B commits [4:3] (commit_index=4, applied to FSM)
+A crashes
+
+Election: C tries to become leader
+B votes NO (C's log behind: last term 2 < B's last term 3)
+B becomes leader, replicates [4:3] to C
+✅ SAFE: Committed entry preserved (Leader Completeness Property)
+```
+
+---
+
+#### Leader Completeness Property
+
+**Guarantee**: If an entry is committed, all future leaders will have it.
+
+**How**: 
+- Committed entry → On majority of nodes
+- New leader → Must get majority votes
+- Voting rule → Only vote if candidate's log ≥ mine
+- Result → Leader always has committed entries ✅
+
+---
+
+#### Majority Failure
+
+**If both A and B die after [4:3] is committed:**
+```
+- C cannot elect itself (needs 2/3 votes, only has 1)
+- Cluster UNAVAILABLE ❌
+- Data safe on A/B's disks ✅
+- Recovers when A or B restarts
+
+Fault tolerance: 3-node cluster tolerates 1 failure, not 2
+```
+
+**Summary Table:**
+
+| Scenario | [4:3] Committed? | C Can Become Leader? | Safe? |
+|----------|------------------|----------------------|-------|
+| A crashes before heartbeat | ❌ NO | ✅ YES | ✅ Client didn't get "OK" |
+| A crashes after B commits | ✅ YES | ❌ NO | ✅ B votes against C |
+| Both A+B dead | ✅ YES (on disk) | ❌ NO | ✅ Cluster unavailable, data safe |
+
+---
+
+### Scenario D: Late Leader Heartbeat → Unnecessary Election
+
+**Symptom**: Leader is alive and functioning, but one follower starts an unnecessary election due to missed heartbeats.
+**Cause**: Network delay/packet loss causes heartbeat to arrive late at one follower.
 
 #### The Problem
 
 ```
-Before crash:
-Leader (A):  [1:1] [2:1] [3:2] [4:3]
-Follower (B):[1:1] [2:1] [3:2] [4:3]
-Follower (C):[1:1] [2:1] [3:2]        ← Missing entry 4
+t=0s:  Leader (term 5) sends heartbeat to all followers
+t=0.1s: Follower A receives heartbeat → reset timer
+t=0.1s: Follower B receives heartbeat → reset timer  
+t=0.1s: Follower C's heartbeat LOST (network glitch)
 
-Leader A crashes, B becomes new leader (term 4)
+t=5s:  Leader sends another heartbeat
+t=5.1s: A, B receive → reset timers
+t=5.1s: C's heartbeat LOST again (bad network path)
 
-B appends new entry:
-Leader (B):  [1:1] [2:1] [3:2] [4:3] [5:4] ← New entry term 4
-
-B crashes, C becomes leader (term 5)
-
-C's log is BEHIND:
-Leader (C):  [1:1] [2:1] [3:2]
-
-C appends entry:
-Leader (C):  [1:1] [2:1] [3:2] [4:5] ← CONFLICT! Different term at index 4
-
-When B recovers, its log conflicts with C
+t=10s: C's election timeout fires (no heartbeat for 10s)
+t=10s: C → CANDIDATE, term 5 → 6, votes for self
 ```
 
-#### The Fix: Leader Overwrites Follower
+#### The Mechanism
+
+```mermaid
+sequenceDiagram
+    participant Leader as Leader (term 5)
+    participant A as Follower A
+    participant B as Follower B
+    participant C as Follower C
+    
+    Leader->>A: Heartbeat (term 5)
+    Leader->>B: Heartbeat (term 5)
+    Note over C: Network delay - heartbeat lost
+    
+    rect rgb(255, 200, 200)
+        Note over C: Timeout! No heartbeat received
+    end
+    
+    C->>C: Become CANDIDATE<br/>term 5 → 6<br/>Vote for self
+    
+    C->>Leader: RequestVote(term=6)
+    C->>A: RequestVote(term=6)
+    C->>B: RequestVote(term=6)
+    
+    rect rgb(255, 220, 200)
+        Note over Leader: See term 6 > current term 5
+        Leader->>Leader: Step down to FOLLOWER<br/>term = 6<br/>voted_for = None
+    end
+    
+    Leader-->>C: Vote: YES ✅
+    A-->>C: Vote: YES ✅
+    B-->>C: Vote: YES ✅
+    
+    rect rgb(200, 255, 200)
+        Note over C: Majority (3/3)<br/>Become LEADER
+    end
+    
+    C->>Leader: Heartbeat (term 6, I am leader)
+    C->>A: Heartbeat (term 6, I am leader)
+    C->>B: Heartbeat (term 6, I am leader)
+    
+    Note over Leader,C: Old leader now follower<br/>C is new leader for term 6
+```
+
+#### Timeline Breakdown
+
+```
+t=10.0s: C's election timeout expires
+         C → CANDIDATE
+         current_term = 6
+         voted_for = C (self)
+         
+t=10.1s: C sends RequestVote(term=6) to Leader, A, B
+
+# At the old Leader:
+t=10.2s: Leader receives RequestVote(term=6)
+         → def on_request_vote(C, term=6, ...):
+         → See: candidate_term (6) > current_term (5)
+         → Action: current_term = 6
+         → Action: step_down_to_follower()  # Leader → Follower!
+         → Action: voted_for = None
+         → Check: C's log up-to-date? YES
+         → Return: Vote YES ✅
+
+# At Follower A:
+t=10.2s: A receives RequestVote(term=6)
+         → See: term 6 > current term 5
+         → Update: current_term = 6
+         → voted_for = None
+         → Check: C's log up-to-date? YES
+         → Return: Vote YES ✅
+
+# At Follower B:
+t=10.2s: (same as A, votes YES)
+
+t=10.3s: C receives 3 votes (including self)
+         → 3/3 = majority!
+         → Transition: CANDIDATE → LEADER
+         → Start sending heartbeats
+
+t=10.4s: All nodes receive heartbeat(term=6) from C
+         → They recognize C as new leader
+
+t=10.5s: System back to normal, C is now leader
+```
+
+**Total Disruption Time**: ~300ms (from when C starts election to when it sends first heartbeat as leader)
+
+#### Why This is SAFE (Not a Bug, It's a Feature!)
+
+**This behavior prevents split-brain scenarios:**
 
 ```python
-# Leader C sends AppendEntries to Follower B
-AppendEntries(
-    prev_log_index=3,
-    prev_log_term=2,
-    entries=[LogEntry(index=4, term=5, cmd="SET y=10")]
-)
-
-# Follower B checks:
-# - log[3].term == 2? YES (match)
-# - log[4] exists? YES
-# - log[4].term == 5? NO (B has term 3, leader has term 5)
-
-# Follower B's action:
-# 1. Delete conflicting entry and all following: log = log[:4]
-# 2. Append leader's entry: log.append(LogEntry(4, 5, "SET y=10"))
-
-# Result: B's log now matches leader C
+# Imagine the old leader was actually partitioned:
+# - Old leader can see Follower A (minority)
+# - Followers B, C can't reach old leader (majority)
+# 
+# Without stepping down:
+# - Old leader thinks it's still leader
+# - B, C elect new leader
+# - TWO LEADERS → Split brain!
+#
+# With stepping down:
+# - Old leader sees higher term → steps down immediately
+# - Even if it was healthy, it recognizes newer authority
+# - Only ONE leader can exist (C in term 6)
 ```
 
-**Safety Guarantee**: Uncommitted entries can be overwritten. Committed entries (replicated to majority) are NEVER lost (Leader Completeness Property).
+**Key Safety Properties:**
+1. **Old leader cannot commit** any writes once C starts election (term mismatch)
+2. **No data loss**: All committed entries preserved (Leader Completeness Property)
+3. **Brief unavailability**: Writes fail for ~100-300ms during election
+4. **Automatic recovery**: System self-heals, new leader established
+
+#### Prevention Strategies
+
+**1. Tune Election Timeout Higher**:
+- Increase election timeout: `random(1500ms, 3000ms)` instead of `150-300ms`
+- Keep heartbeat interval: `100ms`
+- **Effect**: Now need to miss 15-30 consecutive heartbeats before election starts
+- **Benefit**: Much less likely to trigger from transient network issues
+
+**2. Monitor Network Health**:
+- **Track packet loss** between Raft nodes:
+  - Use: `ping -c 100 node-C`
+  - If packet loss > 1% → investigate network issues
+
+- **Monitor leader election rate**:
+  - Use: `rate(raft_leader_elections_total[1h])`
+  - Alert if > 1 election/hour (indicates instability)
+
+**3. Use Dedicated Network**:
+- Don't share network with application traffic
+- Give Raft its own VLAN/subnet for reliable heartbeats
+- Prevents application traffic from interfering with consensus
+
+**4. Pre-Vote Extension** (Raft optimization):
+- **Before becoming CANDIDATE**, ask: "Would you vote for me?"
+- Only become CANDIDATE if majority says "yes"
+- **Steps**:
+  1. Node about to timeout sends "pre-vote" request
+  2. Other nodes respond: "I would vote for you" (but don't actually vote yet)
+  3. If majority would vote → become CANDIDATE and start real election
+  4. If majority wouldn't vote → stay FOLLOWER
+- **Benefit**: Prevents unnecessary elections from a single slow node
+
+#### When Is This Actually a Problem?
+
+**Bad Network Patterns**:
+
+**Symptom**: Follower C consistently slower than A, B  
+**Cause**: C is in different rack/AZ with higher latency
+
+**Timeline**:
+- **t=0s**: Heartbeat sent → A receives in 1ms, B receives in 1ms, C receives in 15ms
+- **t=0.05s**: Leader sends another heartbeat
+- **t=0.06s**: A and B receive immediately
+- **t=0.07s**: C receives previous heartbeat (delayed 70ms!)
+- **t=0.10s**: Leader sends another heartbeat
+- C still processing previous one, misses this one
+- **t=0.15s**: Election timeout triggered!
+
+**Solution**: Move C to same datacenter/AZ as other nodes
+
+**Statistics from Production Systems**:
+- **etcd**: Recommends election timeout = 10× heartbeat interval
+- **Consul**: Default 150-300ms election timeout, 50ms heartbeat
+- **Research**: <1% false elections if timeout > 30× network latency
 
 ---
 
@@ -516,29 +905,31 @@ AppendEntries(
 | **Max Log Size** | Unlimited | 1GB-10GB | Prevent unbounded log growth |
 
 **Election Timeout Tuning**:
-```
-Rule: election_timeout >> network_latency
 
-Example:
-- Network latency: 5ms (same datacenter)
-- Recommended: 150-300ms (30-60x network latency)
+**Rule**: `election_timeout >> network_latency`
 
-- Network latency: 50ms (cross-AZ)
-- Recommended: 500ms-1s
-```
+**Examples**:
+- **Same datacenter**:
+  - Network latency: 5ms
+  - Recommended: 150-300ms (30-60x network latency)
+
+- **Cross-AZ**:
+  - Network latency: 50ms
+  - Recommended: 500ms-1s
+
+---
 
 **Batch Commit Optimization**:
-```python
-# Instead of committing each entry individually:
-for entry in entries:
-    replicate_and_commit(entry)  # 1 RTT each
 
-# Batch multiple entries:
-batch = collect_entries_for_10ms()  # Collect entries for 10ms
-replicate_and_commit(batch)  # 1 RTT for entire batch
+**Instead of**: Committing each entry individually
+- Each entry needs 1 RTT
+- Low throughput for many small writes
 
-# Result: 10x throughput improvement for write-heavy workloads
-```
+**Better approach**: Batch multiple entries
+1. Collect entries for 10ms
+2. Replicate and commit entire batch in 1 RTT
+
+**Result**: 10x throughput improvement for write-heavy workloads
 
 ---
 
@@ -555,13 +946,12 @@ replicate_and_commit(batch)  # 1 RTT for entire batch
 
 **Key Limitation**: **Cannot tolerate N/2 failures**.
 
-```
-Cluster Size | Tolerated Failures | Quorum
-     3       |         1          |   2
-     5       |         2          |   3
-     7       |         3          |   4
-     9       |         4          |   5
-```
+| Cluster Size | Tolerated Failures | Quorum |
+|:-------------|:-------------------|:-------|
+| 3            | 1                  | 2      |
+| 5            | 2                  | 3      |
+| 7            | 3                  | 4      |
+| 9            | 4                  | 5      |
 
 **Why Odd Numbers?**: 4-node cluster tolerates only 1 failure (same as 3-node), so 3 is more cost-effective.
 

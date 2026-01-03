@@ -1,1 +1,0 @@
-![Digital_certificate Flow](./resource/digital_certificate_flow.svg)

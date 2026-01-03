@@ -55,6 +55,14 @@ All documents must follow this exact organizational flow:
 *   **C. Distribution Model** (partitioning, sharding, routing)
 *   **D. Delivery Guarantees** (at-most-once, at-least-once, exactly-once)
 
+**For Distributed Systems (Databases, Message Brokers, etc.)**:
+*   **Global-Level Deployment**: Multi-region, cross-datacenter, geo-replication strategies
+*   **Consensus Mechanisms**: Raft, Paxos, Gossip, or custom protocols (if used)
+*   **Replication**: Master-slave, multi-master, leaderless architectures
+*   **Consistency Models**: Strong, eventual, causal consistency trade-offs
+*   **Failure Detection**: How nodes detect failures (heartbeats, timeouts)
+*   **Network Partitions**: How system behaves during split-brain scenarios
+
 **Style**:
 *   Use concrete examples
 *   Avoid deep technical jargon
