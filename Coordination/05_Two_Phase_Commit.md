@@ -26,10 +26,10 @@
 ```mermaid
 sequenceDiagram
     participant Client
-    participant Coord as Coordinator<br/>(Transaction Manager)
-    participant P1 as Participant 1<br/>(Database A)
-    participant P2 as Participant 2<br/>(Database B)
-    participant P3 as Participant 3<br/>(Database C)
+    participant Coord as "Coordinator (Transaction Manager)"
+    participant P1 as "Participant 1 (Database A)"
+    participant P2 as "Participant 2 (Database B)"
+    participant P3 as "Participant 3 (Database C)"
     
     Client->>Coord: Begin Transaction
     
@@ -48,7 +48,7 @@ sequenceDiagram
     
     rect rgb(200, 255, 200)
         Note over Coord,P3: Phase 2: Commit (Decision)
-        Coord->>Coord: All voted PREPARED<br/>→ Decision: COMMIT
+        Coord->>Coord: "All voted PREPARED → Decision: COMMIT"
         
         par Send Commit to All
             Coord->>P1: COMMIT
@@ -105,8 +105,8 @@ sequenceDiagram
             Coord->>DB_B: PREPARE (txn_id=123)
         end
         
-        DB_A->>DB_A: Execute locally<br/>Write undo/redo logs<br/>Acquire locks
-        DB_B->>DB_B: Execute locally<br/>Write undo/redo logs<br/>Acquire locks
+        DB_A->>DB_A: "Execute locally, Write undo/redo logs, Acquire locks"
+        DB_B->>DB_B: "Execute locally, Write undo/redo logs, Acquire locks"
         
         DB_A->>Coord: PREPARED ✅
         DB_B->>Coord: PREPARED ✅
@@ -138,15 +138,15 @@ sequenceDiagram
     rect rgb(200, 255, 200)
         Note over Coord,DB_B: Phase 2 - Commit
         
-        Coord->>Coord: All votes are PREPARED<br/>Write "COMMIT" to log (durable)
+        Coord->>Coord: "All votes are PREPARED, Write COMMIT to log (durable)"
         
         par Send Commit to All
             Coord->>DB_A: COMMIT (txn_id=123)
             Coord->>DB_B: COMMIT (txn_id=123)
         end
         
-        DB_A->>DB_A: Apply changes<br/>Release locks
-        DB_B->>DB_B: Apply changes<br/>Release locks
+        DB_A->>DB_A: "Apply changes, Release locks"
+        DB_B->>DB_B: "Apply changes, Release locks"
         
         DB_A->>Coord: ACK ✅
         DB_B->>Coord: ACK ✅
@@ -223,21 +223,21 @@ State:
 
 ```mermaid
 sequenceDiagram
-    participant C as Participant C<br/>(RESTARTED)
+    participant C as "Participant C (RESTARTED)"
     participant Coord as Coordinator
     
     rect rgb(255, 200, 200)
-        Note over C: Crash recovery started<br/>Found: txn_123 in PREPARED state
+        Note over C: "Crash recovery started - Found: txn_123 in PREPARED state"
     end
     
     C->>Coord: What was decision for txn_123?
     
-    Coord->>Coord: Read transaction log<br/>Found: "COMMIT txn_123"
+    Coord->>Coord: "Read transaction log - Found: COMMIT txn_123"
     
     Coord->>C: COMMIT txn_123
     
     rect rgb(200, 255, 200)
-        C->>C: Apply COMMIT<br/>Release locks<br/>Transaction complete
+        C->>C: "Apply COMMIT, Release locks, Transaction complete"
     end
     
     Note over C,Coord: Consistency restored ✅
@@ -319,13 +319,13 @@ graph TD
     Timeline["Timeline"]
     
     T0["t=0: Coord sends PREPARE"]
-    T1["t=1: A votes PREPARED<br/>B votes PREPARED"]
-    T2["t=2: Coord CRASHES<br/>(before sending decision)"]
-    T3["t=3: A and B BLOCKED<br/>(holding locks, waiting for decision)"]
+    T1["t=1: A votes PREPARED, B votes PREPARED"]
+    T2["t=2: Coord CRASHES (before sending decision)"]
+    T3["t=3: A and B BLOCKED (holding locks, waiting for decision)"]
     
     Timeline --> T0 --> T1 --> T2 --> T3
     
-    T3 --> Problem["PROBLEM:<br/>A and B hold locks indefinitely<br/>System BLOCKED until Coord recovers"]
+    T3 --> Problem["PROBLEM: A and B hold locks indefinitely - System BLOCKED until Coord recovers"]
     
     style Problem fill:#ff9999
 ```
@@ -404,8 +404,8 @@ sequenceDiagram
         Coord->>Pay: COMMIT txn_500
     end
     
-    Inv->>Inv: Apply: qty=10 → qty=9<br/>Release locks
-    Pay->>Pay: Apply: INSERT payment<br/>Release locks
+    Inv->>Inv: "Apply: qty=10 → qty=9, Release locks"
+    Pay->>Pay: "Apply: INSERT payment, Release locks"
     
     Inv->>Coord: ACK ✅
     Pay->>Coord: ACK ✅
@@ -451,11 +451,11 @@ sequenceDiagram
     
     Note over Coord: Timeout (30s)
     
-    Coord->>Coord: Decision: ABORT<br/>(not all voted PREPARED)
+    Coord->>Coord: "Decision: ABORT (not all voted PREPARED)"
     
     Coord->>Inv: ABORT
     
-    Inv->>Inv: Rollback (undo log)<br/>Release locks
+    Inv->>Inv: "Rollback (undo log), Release locks"
 ```
 
 **Result**: Transaction aborted. Inventory change rolled back. **Consistent**.
@@ -499,12 +499,12 @@ sequenceDiagram
     
     rect rgb(200, 255, 200)
         Note over NewCoord: Recovery process starts
-        NewCoord->>NewCoord: Read transaction log<br/>Found: "COMMIT txn_500"
+        NewCoord->>NewCoord: "Read transaction log - Found: COMMIT txn_500"
     end
     
     NewCoord->>Pay: COMMIT txn_500
     
-    Pay->>Pay: Apply commit<br/>Release locks
+    Pay->>Pay: "Apply commit, Release locks"
     Pay->>NewCoord: ACK ✅
     
     Note over NewCoord,Pay: Consistency restored!

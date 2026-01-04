@@ -30,9 +30,9 @@ Vector clocks assign each replica a counter and track the maximum counter seen f
 ```mermaid
 graph TD
     subgraph System["Distributed Key-Value Store (3 Replicas)"]
-        R1["Replica A<br/>Vector: {A:1, B:0, C:0}"]
-        R2["Replica B<br/>Vector: {A:0, B:1, C:0}"]
-        R3["Replica C<br/>Vector: {A:0, B:0, C:1}"]
+        R1["Replica A - Vector: {A:1, B:0, C:0}"]
+        R2["Replica B - Vector: {A:0, B:1, C:0}"]
+        R3["Replica C - Vector: {A:0, B:0, C:1}"]
     end
     
     Client1["Client 1"] -->|"Write key=X"| R1
@@ -42,7 +42,7 @@ graph TD
     R2 -->|"Gossip"| R3
     R3 -->|"Gossip"| R1
     
-    Note["Each write increments local counter<br/>Gossip merges vector clocks"]
+    Note["Each write increments local counter - Gossip merges vector clocks"]
     
     style R1 fill:#ccffcc
     style R2 fill:#e6f3ff
@@ -94,7 +94,7 @@ graph LR
     V1["{A:2, B:1, C:0}"] -->|"Happened-before"| V2["{A:3, B:1, C:0}"]
     V3["{A:2, B:2, C:0}"] -.->|"Concurrent"| V4["{A:3, B:1, C:0}"]
     
-    Note["V1 < V2: Causal order<br/>V3 || V4: No causal order"]
+    Note["V1 < V2: Causal order - V3 || V4: No causal order"]
     
     style V1 fill:#ccffcc
     style V2 fill:#ccffcc

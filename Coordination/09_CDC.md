@@ -41,9 +41,9 @@ CDC systems read database transaction logs and publish changes to an event strea
 ```mermaid
 graph LR
     subgraph Source["Source Database (PostgreSQL)"]
-        App["Application<br/>(Inserts, Updates, Deletes)"]
+        App["Application (Inserts, Updates, Deletes)"]
         Table["Users Table"]
-        WAL["Write-Ahead Log<br/>(Transaction Log)"]
+        WAL["Write-Ahead Log (Transaction Log)"]
     end
     
     subgraph CDC_System["CDC System"]
@@ -53,13 +53,13 @@ graph LR
     end
     
     subgraph Event_Stream["Event Stream"]
-        Kafka["Kafka Topic<br/>db.users.changes"]
+        Kafka["Kafka Topic - db.users.changes"]
     end
     
     subgraph Consumers["Downstream Systems"]
-        ES["Elasticsearch<br/>(Search)"]
-        DW["Data Warehouse<br/>(Analytics)"]
-        Cache["Redis<br/>(Cache)"]
+        ES["Elasticsearch (Search)"]
+        DW["Data Warehouse (Analytics)"]
+        Cache["Redis (Cache)"]
     end
     
     App --> Table

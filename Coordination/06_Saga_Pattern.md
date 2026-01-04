@@ -64,12 +64,12 @@ sequenceDiagram
 ```mermaid
 graph TD
     Client["Client"]
-    Orch["Saga Orchestrator<br/>(Order Service)"]
+    Orch["Saga Orchestrator (Order Service)"]
     
     subgraph Services
-        IS["Inventory<br/>Service"]
-        PS["Payment<br/>Service"]
-        SS["Shipping<br/>Service"]
+        IS["Inventory Service"]
+        PS["Payment Service"]
+        SS["Shipping Service"]
     end
     
     Client -->|"1. Place Order"| Orch

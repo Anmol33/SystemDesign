@@ -40,9 +40,9 @@ graph TD
     Client["Client Application"]
     
     subgraph Command_Side["Command Side (Write Model)"]
-        CmdAPI["Command API<br/>(POST, PUT, DELETE)"]
-        CmdHandler["Command Handlers<br/>(Business Logic)"]
-        WriteDB["Write Database<br/>(Normalized)"]
+        CmdAPI["Command API (POST, PUT, DELETE)"]
+        CmdHandler["Command Handlers (Business Logic)"]
+        WriteDB["Write Database (Normalized)"]
     end
     
     subgraph Sync["Synchronization"]
@@ -50,9 +50,9 @@ graph TD
     end
     
     subgraph Query_Side["Query Side (Read Model)"]
-        QueryAPI["Query API<br/>(GET)"]
+        QueryAPI["Query API (GET)"]
         QueryHandler["Query Handlers"]
-        ReadDB["Read Database<br/>(Denormalized)"]
+        ReadDB["Read Database (Denormalized)"]
     end
     
     Client -->|"Commands (Create, Update)"| CmdAPI
