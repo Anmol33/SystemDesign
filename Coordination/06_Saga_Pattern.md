@@ -1051,13 +1051,165 @@ Allows efficient cleanup of old sagas
 10. [ ] **Document Compensations**: Each step's compensation must be documented
 
 **Critical Metrics**:
+
 ```
-saga_execution_time: p50 < 1s, p99 < 5s
-saga_success_rate: > 95%
-compensation_execution_time: p50 < 500ms
-saga_failed_state_count: 0 (alert if > 0)
-dlq_message_age: < 1 hour
+# Execution Metrics
+saga_execution_time_seconds:
+  p50 < 1s (good), p90 < 3s, p99 < 5s (alert if > 10s)
+  Measures end-to-end saga completion time
+  
+saga_step_duration_seconds{step="reserve_inventory|charge_payment|ship_order"}:
+  Track per-step latency to identify bottlenecks
+  Alert if any step consistently > 2s
+  
+saga_started_total:
+  rate(5m) - baseline for traffic patterns
+  Use for capacity planning
+
+# Success Metrics  
+saga_success_rate:
+  > 95% (good), 90-95% (warning), < 90% (critical)
+  Formula: successful_sagas / total_sagas
+  
+saga_state_count{state="COMPLETED|FAILED|COMPENSATING|IN_PROGRESS"}:
+  Monitor distribution of final states
+  IN_PROGRESS should be low (< 10% of total)
+
+# Compensation Metrics
+compensation_invoked_total:
+  rate(5m) indicates failure frequency
+  Baseline to detect anomalies
+  
+compensation_execution_time_seconds:
+  p50 < 500ms, p99 < 2s
+  Compensations should be fast
+  
+compensation_failure_rate:
+  < 0.1% (compensations MUST succeed)
+  > 0.1% = CRITICAL alert
+
+# Infrastructure Metrics
+saga_concurrent_executions:
+  Monitor for resource exhaustion
+  Alert if > 80% of max capacity
+  
+dlq_message_count:
+  0 (ideal), < 10 (acceptable), > 10 (alert)
+  
+dlq_message_age_seconds:
+  < 3600 (1 hour) - messages should be processed quickly
+  > 3600 = manual intervention needed
+  
+event_bus_lag_milliseconds:
+  < 1000ms for real-time processing
+  > 5000ms = service degradation
 ```
+
+**Troubleshooting Commands**:
+
+```bash
+# Check saga state in database
+SELECT saga_id, state, current_step, created_at, updated_at
+FROM saga_executions
+WHERE state IN ('FAILED', 'COMPENSATING')
+ORDER BY updated_at DESC
+LIMIT 10;
+
+# View saga execution timeline for specific saga
+SELECT saga_id, step_name, status, started_at, completed_at,
+       EXTRACT(EPOCH FROM (completed_at - started_at)) as duration_seconds
+FROM saga_steps
+WHERE saga_id = '<saga-id>'
+ORDER BY started_at;
+
+# Check event bus dead letter queue (Kafka)
+kafka-console-consumer \
+  --bootstrap-server localhost:9092 \
+  --topic saga-dlq \
+  --from-beginning \
+  --max-messages 10
+
+# View distributed trace for failed saga (Jaeger)
+curl http://jaeger:16686/api/traces/<trace-id>
+
+# Check orchestrator health and recent errors
+kubectl logs deployment/saga-orchestrator --tail=100 | grep -i "error\|timeout\|compensation"
+
+# Monitor saga execution rates (Prometheus)
+curl http://prometheus:9090/api/v1/query?query=rate(saga_started_total[5m])
+
+# Check outbox table for unpublished events
+SELECT * FROM outbox
+WHERE published = false
+  AND created_at < NOW() - INTERVAL '1 minute'
+ORDER BY created_at
+LIMIT 10;
+
+# Find sagas stuck in IN_PROGRESS state
+SELECT saga_id, current_step, updated_at,
+       EXTRACT(EPOCH FROM (NOW() - updated_at)) as stuck_seconds
+FROM saga_executions
+WHERE state = 'IN_PROGRESS'
+  AND updated_at < NOW() - INTERVAL '5 minutes';
+```
+
+**Monitoring Alerts**:
+
+```
+Alert: saga_success_rate < 95% for 10 minutes
+Action:
+  - Check logs: kubectl logs deployment/saga-orchestrator | grep ERROR
+  - Identify failing step: Check saga_step_duration_seconds metrics
+  - Verify downstream services are healthy (inventory, payment, shipping)
+  - Check if specific saga type is consistently failing
+  - Review compensation logic if many compensations triggered
+
+Alert: saga_execution_time_p99 > 10s for 5 minutes
+Action:
+  - Identify slow step: Query saga_step_duration_seconds by step name
+  - Check step-specific metrics:
+    * Inventory service response time
+    * Payment gateway latency
+    * Shipping API availability
+  - Review database query performance (slow queries log)
+  - Check for network latency issues between services
+
+Alert: saga_failed_state_count > 0
+Action:
+  - IMMEDIATE: Investigate specific saga_id from metrics
+  - Query: SELECT * FROM saga_executions WHERE state = 'FAILED'
+  - Check if compensation succeeded or also failed
+  - If compensation failed: Manual intervention required
+    * Review data integrity
+    * May need manual rollback
+    * Check DLQ for stuck messages
+  - Root cause analysis on why initial step failed
+
+Alert: dlq_message_count > 10
+Action:
+  - Review DLQ messages: kafka-console-consumer --topic saga-dlq
+  - Identify patterns: Same saga type? Same service?
+  - Check if services are handling retries properly
+  - Common causes:
+    * Service temporarily down (retry after recovery)
+    * Data validation errors (requires code fix)
+    * Timeout too aggressive (increase timeout config)
+  - May need to replay messages after fixing root cause
+
+Alert: compensation_failure_rate > 1%
+Action:
+  - ⚠️ CRITICAL: Compensations MUST succeed for data consistency
+  - Identify failing compensations:
+    SELECT * FROM saga_steps WHERE step_type = 'COMPENSATION' AND status = 'FAILED'
+  - Check compensation logic for bugs
+  - Common issues:
+    * Compensation not idempotent
+    * Missing data for compensation
+    * Service unavailable during compensation
+  - May require manual data fixes to restore consistency
+  - Escalate to on-call engineer immediately
+```
+
 
 ---
 
