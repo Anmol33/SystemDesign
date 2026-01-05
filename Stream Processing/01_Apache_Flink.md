@@ -634,23 +634,135 @@ New event arrives: {user: "alice", product: "case", time: 10:06}
 
 ## 4. Deep Dive: Internal Mechanisms
 
-### A. Checkpoint Mechanism (Chandy-Lamport Algorithm)
+### A. Checkpoint Mechanism: Preventing Duplicate Processing
 
-**Goal**: Distributed snapshot without pausing the stream
+**Scenario**: You're running a banking app on Flink that processes money transfers.
 
-**Algorithm**:
 ```
-1. Checkpoint Coordinator (JobMaster): "Time for checkpoint!"
-2. Inject barrier into source operators
-3. Barrier flows downstream with data
-4. When operator sees barrier on ALL inputs:
-   - Snapshot state
-   - Forward barrier downstream
-5. Sink acknowledges completion
-6. Global checkpoint committed
+Transaction arrives: Transfer $1000 from Alice to Bob
+
+Flink processing:
+1. Source: Read event from Kafka
+2. Debit Operator: Deduct $1000 from Alice's account
+   → Alice balance: $5000 → $4000 ✓
+3. CRASH! TaskManager dies
+4. Credit Operator: (never executed) Add $1000 to Bob
+
+Result: Alice lost $1000, Bob never received it
 ```
 
-**Detailed Flow**:
+**The Recovery Dilemma**:
+
+```
+Option 1: Restart from beginning
+→ Deduct $1000 from Alice AGAIN
+→ Alice: $4000 → $3000 (WRONG! Double debit)
+
+Option 2: Skip this transaction
+→ Bob never gets his $1000 (WRONG! Money lost)
+```
+
+**The Question**: How do we know **exactly where to restart** so Alice is debited once and Bob is credited once?
+
+---
+
+### The Solution: Checkpoints
+
+**What Flink Needs to Remember**:
+
+1. **Where we are in the stream**: "We've processed up to Kafka offset 1000"
+2. **Current state**: "Alice balance = $4000, Bob balance = $2000"
+3. **What's in-flight**: "Debit complete, credit pending"
+
+**WHY Checkpoints**:
+- Without them: No way to know what's been processed
+- With them: "Restore to checkpoint #5, replay from there"
+- Result: Each transaction processed **exactly once**
+
+---
+
+### Why Not Just "Pause Everything"?
+
+**Naive Approach**: Stop the stream, snapshot all state, resume
+
+```
+00:00:00 - Processing (1M events/sec)
+00:00:05 - PAUSE for snapshot
+00:00:10 - Resume processing
+```
+
+**Problem**:
+- 5-second pause = 5 million events buffered in Kafka
+- **Latency spike**: All fraud detection delayed by 5 seconds
+- **Unacceptable** for real-time systems (fraud happens NOW, not in 5 seconds)
+
+---
+
+### Chandy-Lamport Algorithm: Snapshot Without Pausing
+
+**The Innovation**: Take a consistent snapshot **while events keep flowing**
+
+**Analogy**: 
+
+Imagine taking a photo of a flowing river to count fish:
+- **Naive way**: Dam the river (pause), count, open dam (resume) = downstream drought
+- **Chandy-Lamport**: Put a colored marker in the water
+  - Count all fish that passed before marker
+  - Mark the water level when marker passes
+  - River never stops flowing!
+
+**How Flink Does It**:
+
+```
+Step 1: Inject "Barrier" (the marker)
+Checkpoint Coordinator: "Start checkpoint #5!"
+→ Inserts barrier into Kafka source
+
+Step 2: Barrier flows downstream with data
+Source: Snapshot "Kafka offset = 1000", forward barrier
+Debit Op: Process event... process event... SEE BARRIER
+        → Snapshot "Alice: $4000, Bob: $2000"
+        → Forward barrier
+Credit Op: Process event... process event... SEE BARRIER
+         → Snapshot state, forward barrier
+
+Step 3: Sink acknowledges
+Sink: "I've seen barrier #5, my state is saved"
+→ ACK sent to coordinator
+
+Step 4: Global checkpoint complete
+Coordinator: "All operators ACK'd barrier #5"
+→ Checkpoint #5 is now valid recovery point
+```
+
+**Key Insight**: Events keep flowing WHILE barriers propagate. No processing pause!
+
+---
+
+### Barrier Alignment: Ensuring Consistency
+
+**Challenge**: Operator has multiple inputs
+
+```
+Input 1 (fast): Events 1, 2, 3, BARRIER #5, 4, 5, 6
+Input 2 (slow): Events 1, 2, 3, 4, 5, 6, 7, BARRIER #5
+```
+
+**What happens**:
+1. Operator sees barrier from Input 1 first
+2. **Blocks Input 1** (buffers events 4, 5, 6)
+3. Continues processing Input 2 (events 4, 5, 6, 7)
+4. Sees barrier from Input 2
+5. **Now snapshots state** (consistent state = processed all pre-barrier events)
+6. Unblocks Input 1, processes buffered events
+
+**WHY Block**:
+- Without blocking: State snapshot includes events after barrier = inconsistent
+- With blocking: State snapshot includes ONLY pre-barrier events = consistent
+
+---
+
+### Checkpoint Flow Diagram
 
 ```mermaid
 sequenceDiagram
@@ -660,98 +772,619 @@ sequenceDiagram
     participant Sink as Sink
     
     Chk->>Src: "1. Inject Barrier (ID=5)"
-    Note right of Src: "Snapshot Offset (Kafka partition 0, offset 1000)"
+    Note right of Src: "Snapshot Offset<br/>(Kafka offset 1000)"
     Src->>Op: "Forward Barrier"
     
-    Note right of Op: "2. Buffer Input, Snapshot State (aggregate: count=42)"
+    Note right of Op: "2. Wait for barrier on ALL inputs<br/>Snapshot State<br/>(Alice: $4000, Bob: $2000)"
     Op->>Sink: "Forward Barrier"
     
-    Note right of Sink: "3. Snapshot State, Pre-commit transaction"
+    Note right of Sink: "3. Snapshot State<br/>Pre-commit transaction"
     Sink-->>Chk: "ACK Barrier 5"
     
     Note over Chk: "Global Checkpoint Complete"
 ```
 
-**State Storage**:
+---
+
+### Where Checkpoint State is Stored
+
+**Checkpoint #5 on S3**:
 ```
-Checkpoint 5:
-  s3://bucket/checkpoints/5/
-    ├─ _metadata (coordinatorstate, operator list)
-    ├─ source-0/state (Kafka offset: 1000)
-    ├─ operator-1/state (RocksDB snapshot: 500 MB)
-    └─ sink-2/state (Pre-committed Kafka transaction ID)
+s3://flink-checkpoints/job-abc123/checkpoint-5/
+  ├─ _metadata 
+  │   └─ Job topology, operator list, checkpoint ID
+  │
+  ├─ source-operator-0/
+  │   └─ state: Kafka offset = 1000
+  │
+  ├─ debit-operator-1/
+  │   └─ state: RocksDB snapshot (500 MB)
+  │       Contains: Alice: $4000, Bob: $2000, Charlie: $10000...
+  │
+  └─ sink-operator-2/
+      └─ state: Kafka transaction ID (for 2PC)
+```
+
+**On Failure**:
+```
+1. JobMaster detects TaskManager crash
+2. Reads checkpoint #5 from S3
+3. Restores all operator state
+4. Rewinds Kafka consumer to offset 1000
+5. Resumes processing from offset 1000
+
+Result: Events 1000-1234 processed exactly once
 ```
 
 ---
 
-### B. Exactly-Once Sink (2-Phase Commit)
+### Checkpoint Configuration
 
-**Challenge**: How to guarantee exactly-once writes to external systems (Kafka, databases)?
+**Key Parameters**:
 
-**Solution**: Two-Phase Commit (2PC) protocol coordinated with checkpoints
-
-**Phase 1: Pre-commit** (during processing):
-1. Sink receives records from operator
-2. Opens transaction in external system (e.g., Kafka transaction)
-3. Writes records as "uncommitted" (invisible to consumers)
-4. Accumulates writes until checkpoint barrier arrives
-
-**Phase 2: Commit** (on checkpoint complete):
-1. Checkpoint Coordinator confirms: "Checkpoint 5 SUCCESS"
-2. Notifies all sinks via RPC
-3. Each sink commits its transaction
-4. Records now visible atomically to external consumers
-
-**Failure Handling**:
-- **If checkpoint fails**: 
-  - Sink aborts transaction
-  - Uncommitted writes discarded
-  - Flink restarts from last successful checkpoint
-  - Re-processes and re-writes same records (idempotent)
-
-**Configuration** (enable exactly-once):
 ```java
-FlinkKafkaProducer.Semantic.EXACTLY_ONCE  // 2PC enabled
+env.enableCheckpointing(60000);  // Checkpoint every 60 seconds
+env.getCheckpointConfig()
+   .setMinPauseBetweenCheckpoints(30000);  // 30s gap between checkpoints
+   .setCheckpointTimeout(600000);          // 10 min timeout
+   .setMaxConcurrentCheckpoints(1);        // One at a time
 ```
 
-**Transaction Timeout**: Must exceed checkpoint interval (e.g., 15 minutes for 60s checkpoints)
+**Trade-offs**:
+- **Short interval** (10s): Less data loss on failure, higher overhead
+- **Long interval** (300s): Lower overhead, more replay on failure
+- **Typical**: 60s for most workloads
+
+**Checkpoint Duration**: Should be < 10% of interval
+- 60s interval → checkpoint should complete in <6s
+- If taking 30s → increase resources or decrease state size
 
 ---
 
-### C. Credit-Based Backpressure
 
-**Problem**: Fast upstream overwhelms slow downstream
+### B. Exactly-Once Sink: Preventing Duplicate Alerts
 
-**Flink's Solution**: Credit system
+**Scenario**: Your fraud detection system sends alerts to Kafka when suspicious activity is detected.
 
-**Mechanism**:
 ```
-Downstream (Sink):
-  - Has 10 input buffers (32KB each)
-  - Grants credits to upstream: "I have 10 free buffers"
+Flink detects fraud:
+User "alice" made 10 transactions in 1 minute (suspicious!)
 
-Upstream (Source):
-  - Sends data only if it has credits
-  - Decrements credit counter per buffer sent
+Sink operator: Send alert to Kafka
+  → "FRAUD ALERT: alice, 10 tx/min, block card"
 
+Alert sent successfully ✓
+
+CRASH! TaskManager dies immediately after
+
+Flink restarts from checkpoint #5
+  → Replays same fraud detection event
+  → Sends SAME alert to Kafka AGAIN
+
+Result: Customer service receives 2 alerts for 1 fraud event
+       → Blocks alice's card twice
+       → Poor customer experience
+```
+
+**The Question**: How do we ensure alerts are sent **exactly once**, even with failures?
+
+---
+
+### Progressive Solutions: From Naive to Exactly-Once
+
+#### Layer 1: Naive Approach (Send Immediately)
+
+```
+Operator detects fraud
+  → Sink sends alert to Kafka immediately
+  → Continue processing
+
+On crash and replay:
+  → Same event re-processed
+  → Alert sent AGAIN
+  → Result: DUPLICATES
+```
+
+**Problem**: No coordination between Flink checkpoints and external writes
+
+---
+
+#### Layer 2: Wait for Checkpoint (Buffer in Memory)
+
+```
+Operator detects fraud
+  → Sink buffers alert in memory
+  → Wait for checkpoint to complete
+  → Then send to Kafka
+
+On crash BEFORE checkpoint:
+  → Buffered alerts lost (only in memory)
+  → Result: MISSING ALERTS
+```
+
+**Problem**: Data loss if crash happens before checkpoint completes
+
+---
+
+#### Layer 3: Two-Phase Commit (Flink's Solution)
+
+**The Innovation**: Coordinate Flink checkpoints with external system translations
+
+**Phase 1: Pre-commit** (Write but Keep Hidden)
+
+```
+Operator detects fraud → Sends to sink
+
+Sink:
+1. Opens Kafka transaction (transactional.id = "sink-task-0")
+2. Writes alert as UNCOMMITTED
+   → Alert written to Kafka broker
+   → BUT invisible to consumers (transaction not committed)
+3. Continues until checkpoint barrier arrives
+```
+
+**Phase 2: Commit** (Make Visible Atomically)
+
+```
+Checkpoint barrier arrives at sink
+
+Sink:
+1. Snapshots state (includes transaction ID)
+2. Sends ACK to Checkpoint Coordinator
+3. Waits for coordinator's decision
+
+Checkpoint Coordinator:
+  "All operators ACK'd checkpoint #5 → SUCCESS!"
+  → Notifies all sinks via RPC: "COMMIT"
+
+Sink:
+  → Commits Kafka transaction
+  → Alert now visible to consumers
+
+Result: Alert sent exactly once!
+```
+
+---
+
+### Why This Guarantees Exactly-Once
+
+**Case 1: Crash Before Checkpoint Complete**
+
+```
+Sink writes alert (uncommitted)
+CRASH before checkpoint #5 finishes
+
+Kafka transaction: Auto-aborts after timeout (5 minutes)
+  → Uncommitted alert discarded
+
+Flink restarts from checkpoint #4
+  → Re-processes event
+  → Writes alert again (new transaction)
+  → This time checkpoint succeeds
+  → Alert committed
+
+Result: ONE alert delivered (first attempt discarded)
+```
+
+**Case 2: Crash After Checkpoint Complete**
+
+```
+Checkpoint #5 SUCCESS
+Sink commits transaction
+Alert visible to consumers
+CRASH immediately after
+
+Flink restarts from checkpoint #5
+  → Does NOT re-process fraud event (already in checkpoint #5)
+
+Result: ONE alert delivered (no replay)
+```
+
+---
+
+### Two-Phase Commit Flow
+
+**Timeline**:
+
+```
+t=0s:   Fraud detected, sent to sink
+t=1s:   Sink writes to Kafka (uncommitted)
+t=30s:  More alerts accumulated (all uncommitted)
+t=60s:  Checkpoint barrier arrives
+t=61s:  Sink snapshots state, ACKs coordinator
+t=65s:  Coordinator declares "Checkpoint #5 SUCCESS"
+t=66s:  Sink commits Kafka transaction
+t=66s:  All 30s of alerts now visible atomically
+
+Latency: 66s from first detection to delivery
+```
+
+**Trade-off**: Exactly-once comes at cost of increased latency (checkpoint interval)
+
+---
+
+### Configuration
+
+**Enable Exactly-Once**:
+
+```java
+// Flink checkpoint configuration
+env.enableCheckpointing(60000);  // 60s interval
+
+// Kafka sink with exactly-once
+FlinkKafkaProducer<Alert> producer = new FlinkKafkaProducer<>(
+    "fraud-alerts-topic",
+    new AlertSchema(),
+    kafkaProps,
+    FlinkKafkaProducer.Semantic.EXACTLY_ONCE  // Enable 2PC
+);
+```
+
+**Critical Parameter**: Kafka transaction timeout
+
+```properties
+# Kafka broker config
+transaction.max.timeout.ms = 900000  # 15 minutes
+
+# Must be > checkpoint interval + checkpoint duration
+# Example: 60s interval + 30s duration = 90s < 900s ✓
+```
+
+**Why Long Timeout**: 
+- Checkpoint might take long (large state, slow S3)
+- If transaction times out before commit → data loss
+- Rule: `transaction.timeout > checkpoint.interval * 2`
+
+---
+
+### Failure Scenarios
+
+**Scenario A: Kafka Transaction Timeout**
+
+```
+Problem:
+Checkpoint takes 10 minutes (very large state)
+Kafka transaction timeout = 5 minutes
+→ Transaction auto-aborted before commit
+
+Result: Data loss (uncommitted writes discarded)
+
+Fix:
+Increase transaction.max.timeout.ms to 15+ minutes
+OR reduce checkpoint interval
+OR optimize checkpoint duration (incremental checkpoints)
+```
+
+**Scenario B: Partial Commit**
+
+```
+Flink has multiple sinks (Kafka + Database)
+
+Checkpoint succeeds → Coordinator sends "COMMIT"
+Kafka sink commits ✓
+Database sink crashes before commit
+
+Result: Kafka has data, Database missing data
+
+Flink's Handling:
+→ Job fails entirely
+→ Restarts from checkpoint #5
+→ Database sink re-processes and commits
+→ Kafka sink sees duplicate transaction ID → skips (idempotent)
+
+Final Result: Both sinks consistent
+```
+
+---
+
+### Exactly-Once vs At-Least-Once
+
+**Performance Comparison**:
+
+| Mode | Latency | Throughput | Use Case |
+|------|---------|------------|----------|
+| **Exactly-Once** | Higher (+checkpoint interval) | Lower (transaction overhead) | Financial transactions, billing |
+| **At-Least-Once** | Lower (immediate writes) | Higher (no 2PC) | Metrics, logs, idempotent operations |
+
+**When to Use At-Least-Once**:
+```java
+FlinkKafkaProducer.Semantic.AT_LEAST_ONCE
+
+// Use when:
+// 1. Downstream is idempotent (can handle duplicates)
+// 2. Low latency critical (gaming, real-time dashboards)
+// 3. Approximate results acceptable (metrics, analytics)
+```
+
+---
+
+
+### C. Credit-Based Backpressure: Preventing Memory Overflow
+
+**Scenario**: You're reading events from Kafka and writing to a PostgreSQL database.
+
+```
+Kafka Source: Producing 100,000 events/second
+              (Fast! Just reading from disk)
+
+Database Sink: Writing 10,000 rows/second  
+               (Slow! Network + disk I/O + indexes)
+
+Difference: 90,000 events/second need to be buffered somewhere
+```
+
+**The Question**: Where do the extra 90,000 events/second go while waiting for the database?
+
+---
+
+### Naive Approach: Infinite Buffering
+
+**What happens**:
+
+```
+t=0s:  Source reads 100k events, sends to operator
+       Operator buffers 90k events (sink only consumed 10k)
+       Memory: 90k * 1KB = 90 MB buffered
+
+t=1s:  Source reads another 100k events
+       Operator buffers 180k events total
+       Memory: 180 MB buffered
+
+t=10s: 900k events buffered
+       Memory: 900 MB
+
+t=60s: 5.4 million events buffered
+       Memory: 5.4 GB
+
+t=120s: 10.8 million events buffered
+        Memory: 10.8 GB → OUT OF MEMORY!
+        TaskManager CRASHES
+```
+
+**Problem**: Unlimited buffering leads to inevitable OOM crash
+
+---
+
+### Why Not Just Increase Memory?
+
+```
+Option 1: Give TaskManager 50 GB RAM
+  → Delays crash by 10 minutes instead of 2
+  → Still crashes eventually
+  → Wastes money on RAM
+
+Option 2: Spill to disk
+  → Disk fills up (100k events/sec * 1KB = 360 GB/hour)
+  → Disk I/O becomes bottleneck
+  → Defeats purpose of stream processing
+```
+
+**The Real Solution**: Slow down the source to match sink's speed (backpressure)
+
+---
+
+### Flink's Credit-Based Backpressure
+
+**The Innovation**: Fine-grained flow control using buffer credits
+
+#### How It Works
+
+**Step 1: Downstream Declares Capacity**
+
+```
+Sink Operator:
+  - Has 10 input buffers (configurable)
+  - Each buffer: 32 KB
+  - Total capacity: 320 KB
+
+Sends to upstream:
+  "I have 10 free buffers (credits)"
+```
+
+**Step 2: Upstream Sends Only With Credits**
+
+```
+Map Operator (upstream):
+  - Receives 10 credits from sink
+  - Sends 1 buffer of data (32 KB) → Decrements credit
+  - Now has 9 credits remaining
+  - Sends another buffer → 8 credits
+  - ... continues ...
+  - Sends 10th buffer → 0 credits remaining
+  
 When credits = 0:
-  - Upstream blocks
-  - Source stops reading from Kafka (backpressure propagation)
+  → Operator BLOCKS (stops sending to sink)
+  → Starts buffering in its own memory
 ```
 
-**Monitoring**:
+**Step 3: Credits Replenished**
+
 ```
-Flink Web UI → Job → Tasks → Backpressure
-  Status: OK (green) | Low (yellow) | High (red)
+Sink consumes buffer:
+  - Processes data (writes to database)
+  - Frees buffer
+  - Sends credit back to upstream: "I have 1 free buffer"
+
+Map Operator:
+  - Receives credit
+  - Resumes sending (unblocks)
+```
+
+**Step 4: Backpressure Propagates**
+
+```
+Map operator now full (10 buffers filled)
+  → Blocks, stops accepting from Source
+  → Sends 0 credits to Source
+
+Source:
+  → No credits from Map operator
+  → Stops reading from Kafka
+  → Kafka lag increases (data stays in Kafka)
+```
+
+**Result**: Source automatically slows to match sink's speed!
+
+---
+
+### Why This Works: Flow Control
+
+**Analogy**: Traffic lights on highway on-ramp
+
+```
+Highway (Sink): Can handle 10 cars/minute
+On-ramp (Source): Has 100 cars/minute trying to merge
+
+Without backpressure:
+  → 100 cars/min flood highway
+  → Traffic jam, gridlock
+
+With backpressure (metered on-ramp):
+  → Green light only when highway has space
+  → 10 cars/min enter smoothly
+  → Other 90 cars wait at on-ramp (Kafka buffer)
+```
+
+**Key Insight**: Better to buffer in Kafka (durable, designed for it) than in Flink memory (limited, causes crashes)
+
+---
+
+### Backpressure Monitoring
+
+**Flink Web UI**:
+
+```
+Job → Task Managers → Tasks → Backpressure Tab
+
+Task: map-operator-1
+Backpressure: HIGH (red)
+  → This operator is blocked, waiting for downstream
+
+Task: sink-operator-2  
+Backpressure: OK (green)
+  → This operator is bottleneck (slowest in chain)
+```
+
+**Interpretation**:
+
+```
+Source: HIGH backpressure → Blocked by downstream
+Map: HIGH backpressure → Blocked by downstream
+Aggregate: LOW backpressure → Can keep up
+Sink: OK (no backpressure) → BOTTLENECK (slowest)
+
+Diagnosis: Sink is the bottleneck
+Fix: Scale out sink (more parallel instances)
 ```
 
 ---
 
-## 5. End-to-End Walkthrough: Stream Processing Flow
+### Configuration
 
-**Scenario**: Real-time fraud detection on credit card transactions
+**Buffer Tuning**:
 
-### Job Submission
+```yaml
+# Number of network buffers per channel
+taskmanager.network.memory.buffers-per-channel: 2
+
+# Floating buffers (shared pool)
+taskmanager.network.memory.floating-buffers-per-gate: 8
+
+# Total network memory
+taskmanager.network.memory.fraction: 0.1  # 10% of total memory
+```
+
+**Buffer Size** (internal, not configurable):
+- Default: 32 KB per buffer
+- Trade-off: Larger = higher throughput, but worse backpressure granularity
+
+---
+
+### Fixing Backpressure Issues
+
+**Scenario**: Sink showing as bottleneck
+
+**Option 1: Scale Out Sink**
+
+```java
+// Increase parallelism of slow operator
+stream
+  .map(...)  // Parallelism: 16
+  .keyBy(...)
+  .process(...)  // Parallelism: 16
+  .addSink(...)  // Parallelism: 32 (2x to handle load)
+```
+
+**Option 2: Optimize Sink**
+
+```java
+// Batch writes instead of one-by-one
+JdbcSink.sink(
+  "INSERT INTO ...",
+  (ps, event) -> {...},
+  JdbcExecutionOptions.builder()
+    .withBatchSize(1000)        // Batch 1000 writes
+    .withBatchIntervalMs(200)   // Or every 200ms
+    .build()
+);
+
+Result:
+  Before: 10k writes/sec (1 row at a time)
+  After: 50k writes/sec (batched)
+  → Backpressure eliminated
+```
+
+**Option 3: Add Caching Layer**
+
+```
+Flink → Redis (fast, in-memory) → Postgres (batch sync)
+
+Instead of:
+  Flink writes directly to Postgres (slow)
+
+Do:
+  Flink writes to Redis (fast, no backpressure)
+  Separate job syncs Redis → Postgres in batches
+```
+
+---
+
+### Backpressure vs Kafka Lag
+
+**They're related but different**:
+
+| Metric | Meaning | Cause |
+|--------|---------|-------|
+| **Backpressure** | Flink operators blocked | Downstream slower than upstream |
+| **Kafka Lag** | Consumer behind producer | Flink source not reading fast enough |
+
+**Common Pattern**:
+
+```
+High backpressure in Flink
+  → Source stops reading from Kafka
+  → Kafka lag increases
+  → Data piles up in Kafka (good! Durable buffer)
+
+Fix backpressure in Flink
+  → Source resumes reading
+  → Kafka lag decreases
+```
+
+**Key Insight**: Kafka lag is the symptom,  backpressure is the root cause
+
+---
+
+
+## 5. End-to-End Walkthrough: Fraud Detection Pipeline
+
+**Scenario**: You're building a real-time fraud detection system for a bank. The system processes credit card transactions and sends alerts when suspicious patterns are detected.
+
+**Business Requirement**: Detect and alert on fraud within **5 milliseconds** of transaction event, with **exactly-once guarantee** (no duplicate/missing alerts).
+
+---
+
+### Initial Job Submission
 
 ```bash
 flink run -d \
@@ -761,86 +1394,344 @@ flink run -d \
   fraud-detection.jar
 ```
 
-### Step 1: Job Deployment (t=0s)
-
-```
-Dispatcher: Receives job JAR
-  → Creates JobMaster
-  → ResourceManager: Requests 4 TaskManagers from Kubernetes
-  → K8s: Allocates 4 pods (8GB RAM each)
-  → JobMaster: Deploys operators to Task Slots
-```
-
-### Step 2: Stream Processing Loop (ongoing)
-
-```
-Source Operator (Kafka):
-  t=0.001s: Read transaction event
-  {user: "alice", amount: 5000, card: "1234", time: 1704400000000}
-
-Map Operator (Feature Extraction):
-  t=0.002s: Enrich with user history
-  {user: "alice", amount: 5000, avg_30d: 200, score: 0.95}
-
-Keyed State (Fraud Model):
-  t=0.003s: Lookup user state (RocksDB off-heap)
-  State: {alice: {tx_count_1h: 3, total_amount_1h: 15000}}
-  
-  Rule: If tx_count_1h > 5 or amount > avg_30d * 10:
-    Flag as fraud
-
-Window Aggregation (1-hour tumbling):
-  t=0.004s: Increment counters
-  Update state: {alice: {tx_count_1h: 4, total_amount_1h: 20000}}
-
-Sink Operator (Alert to Kafka):
-  t=0.005s: Write alert to Kafka (uncommitted)
-  Pre-commit transaction
-
-Total latency: 5ms (sub-second!)
-```
-
-### Step 3: Checkpointing (every 60s)
-
-```
-t=60s: Checkpoint Coordinator triggers checkpoint #5
-
-Source:
-  Snapshot: Kafka offset = partition 0: offset 120000
-  Forward barrier
-
-Operator:
-  Snapshot: RocksDB state (alice: {tx_count_1h: 4, ...})
-  Write to S3: s3://checkpoints/5/operator-1/state (500 MB)
-  Forward barrier
-
-Sink:
-  Pre-commit Kafka transaction
-  Acknowledge checkpoint
-
-t=65s: Global checkpoint complete
-  → Commit all Kafka transactions
-  → Alerts now visible to consumers
-
-Checkpoint duration: 5 seconds
-```
-
-### Step 4: Failure Recovery (TaskManager crashes)
-
-```
-t=120s: TaskManager 2 crashes (OOM, spot instance loss)
-
-JobMaster detects failure:
-  → Cancel all tasks
-  → Reload state from checkpoint #5 (S3)
-  → Rewind Kafka offsets to checkpoint #5 position
-  → Resume processing
-
-Recovery time: 30 seconds
-  (Checkpoint #5 to #7 = 2 minutes of reprocessing)
-```
+**Job Configuration:**
+- 16 parallel tasks (matches Kafka partitions)
+- JobManager: 2GB RAM (coordinates)
+- TaskManager: 8GB RAM each (executes)
 
 ---
+
+### Step 1: Job Submission and Validation (t=0s)
+
+**Component**: Dispatcher (on JobManager)
+
+**Action**: 
+- Receives `fraud-detection.jar` via REST API
+- Parses job graph (Source → Map → KeyBy → Aggregate → Sink)
+- Validates configuration (parallelism, memory, state backend)
+- Assigns Job ID: `job-abc123`
+
+**State Change**:  
+- Job status: `SUBMITTED` → `INITIALIZING`
+- JobGraph stored in memory
+
+**WHY Dispatcher Exists**:  
+Single entry point for all jobs. Without it, each client would need to find available JobMaster manually. Dispatcher routes jobs and provides job lifecycle API.
+
+**Timing**: ~500ms (JAR upload + parsing)
+
+---
+
+### Step 2: JobMaster Creation (t=0.5s)
+
+**Component**: Dispatcher
+
+**Action**:
+- Creates dedicated JobMaster thread for `job-abc123`
+- JobMaster reads JobGraph
+- Determines resource requirements:
+  - Source: 16 parallel tasks (1 per Kafka partition)
+  - Map: 16 tasks
+  - Aggregate: 16 tasks
+  - Sink: 16 tasks
+  - **Total**: 64 task slots needed
+
+**State Change**:
+- JobMaster spawned (isolated from other jobs)
+- Job status: `INITIALIZING` → `CREATED`
+
+**WHY Per-Job JobMaster**:  
+Isolation. Job A's checkpoint shouldn't interfere with Job B's scheduling. Each job gets dedicated coordinator that manages ONLY its lifecycle.
+
+**Timing**: ~100ms (thread spawn + graph analysis)
+
+---
+
+### Step 3: Resource Request (t=0.6s)
+
+**Component**: JobMaster
+
+**Action**:
+- Sends resource request to ResourceManager:
+  - "Need 64 task slots with 8GB RAM each"
+- ResourceManager checks available TaskManagers:
+  - Currently: 0 TaskManagers running
+  - Needs: 4 TaskManagers (16 slots per TaskManager)
+
+**State Change**:
+- Resource request queued
+- Job status: `CREATED` → `SCHEDULED`
+
+**WHY ResourceManager**:  
+Abstraction layer. Works with Kubernetes, YARN, Mesos, or Standalone. JobMaster doesn't care where resources come from, just requests "give me 64 slots".
+
+**Timing**: ~50ms (resource check)
+
+---
+
+### Step 4: Infrastructure Provisioning (t=0.65s - 10s)
+
+**Component**: ResourceManager + Kubernetes
+
+**Action**:
+- ResourceManager calls Kubernetes API:
+  - `kubectl create pod flink-taskmanager-1` (8GB RAM, 16 CPU cores)
+  - `kubectl create pod flink-taskmanager-2`
+  - `kubectl create pod flink-taskmanager-3`
+  - `kubectl create pod flink-taskmanager-4`
+- Pods start, TaskManagers register with ResourceManager
+
+**State Change**:
+- 4 TaskManagers running, each offering 16 task slots
+- Total: 64 task slots available
+
+**WHY Dynamic Provisioning**:  
+Pay only for what you use. When job finishes, pods destroyed. No idle TaskManagers consuming resources.
+
+**Timing**: ~9-10 seconds (K8s pod startup)
+
+---
+
+### Step 5: Task Deployment (t=10s)
+
+**Component**: JobMaster
+
+**Action**:
+- Deploys operators to task slots:
+  - TaskManager-1: Source tasks 0-15
+  - TaskManager-2: Map tasks 0-15
+  - TaskManager-3: Aggregate tasks 0-15
+  - TaskManager-4: Sink tasks 0-15
+- Establishes network connections between operators
+- Initializes state backend (RocksDB on local SSD)
+
+**State Change**:
+- All 64 tasks: `SCHEDULED` → `DEPLOYING` → `RUNNING`
+- Job status: `SCHEDULED` → `RUNNING`
+
+**WHY Distributed Across TaskManagers**:  
+Parallel processing. 16 Kafka partitions processed simultaneously by 16 source tasks. Total throughput = single-partition throughput * 16.
+
+**Timing**: ~2 seconds (task deployment + network setup)
+
+---
+
+### Step 6: Event Ingestion (t=12.001s) - FIRST EVENT
+
+**Component**: Source Operator (Kafka Consumer)
+
+**Action**:
+- Task 0 reads from Kafka partition 0
+- Event: `{user: "alice", amount: 5000, card: "1234", time: "2024-01-05T10:00:00"}`
+- Assigns event timestamp (Event Time mode)
+- Sends to downstream Map operator
+
+**State Change**:
+- Kafka offset for partition 0: 100000 → 100001
+- Event enters Flink pipeline
+
+**WHY Source Reads Continuously**:  
+Stream processing. Unlike batch (read once, finish), source keeps polling Kafka indefinitely. Stream never ends.
+
+**Timing**: ~1ms (Kafka read)
+
+---
+
+### Step 7: Feature Extraction (t=12.002s)
+
+**Component**: Map Operator (Enrich Event)
+
+**Action**:
+- Receives event from source
+- Calls external service (Redis cache):
+  - Key: `user:alice:profile`
+  - Gets: `{avg_30d: 200, avg_90d: 180, country: "US"}`
+- Enriches event:
+  - `{user: "alice", amount: 5000, ...avg_30d: 200...}`
+- Calculates initial fraud score:
+  - `score = amount / avg_30d = 5000 / 200 = 25` (suspicious!)
+- Sends enriched event to Aggregate operator
+
+**State Change**:
+- Event now has context (user history)
+- Fraud score calculated: 25 (threshold = 10)
+
+**WHY Separate Map Operator**:  
+Reusability. Feature extraction logic same for all fraud models. Keeps business logic (fraud rules) separate from data prep.
+
+**Timing**: ~1ms (Redis lookup + calculation)
+
+---
+
+### Step 8: Stateful Fraud Check (t=12.003s)
+
+**Component**: Aggregate Operator (Keyed State)
+
+**Action**:
+- Event routed by `user` key → Task 5 (alice always goes to same task)
+- Reads RocksDB state for alice:
+  - `{tx_count_1h: 3, total_amount_1h: 15000}`
+- Applies fraud rule:
+  - `IF tx_count_1h > 5 OR amount > avg_30d * 10 THEN flag_fraud`
+  - alice: `tx_count_1h = 3` (OK), `amount = 5000 > 200*10` (FRAUD!)
+- Creates alert event:
+  - `{type: "FRAUD", user: "alice", reason: "Large transaction"}`
+- Updates state:
+  - `{tx_count_1h: 4, total_amount_1h: 20000}`
+  - Writes to RocksDB (off-heap)
+- Sends alert to Sink operator
+
+**State Change**:
+- alice's fraud counter: 3 → 4
+- Alert event created
+
+**WHY Keyed State**:  
+Keeps user-specific counters. alice's transactions always go to same task, so counter is accurate. Without keying, tx_count would be split across multiple tasks (incorrect).
+
+**Timing**: ~1ms (RocksDB read + write)
+
+---
+
+### Step 9: Alert Pre-commit (t=12.004s)
+
+**Component**: Sink Operator (Kafka Producer)
+
+**Action**:
+- Receives alert from Aggregate operator
+- Opens Kafka transaction:
+  - `transactional.id = "sink-task-5"`
+  - `transaction.timeout.ms = 900000` (15 min)
+- Writes alert to `fraud-alerts` topic (UNCOMMITTED):
+  - Alert written to broker
+  - BUT invisible to consumers (transaction not committed)
+- Continues processing more events
+- Accumulates uncommitted writes in memory (buffer)
+
+**State Change**:
+- Alert written to Kafka (uncommitted)
+- Sink buffer: 1 pending alert
+
+**WHY Pre-commit Instead of Immediate Send**:  
+Exactly-once delivery. If Flink crashes before checkpoint, uncommitted writes are discarded. Prevents duplicate alerts on replay.
+
+**Timing**: ~1ms (Kafka write to broker)
+
+**End-to-end latency so far**: 5ms (12.001s → 12.005s)
+
+---
+
+### Step 10: Checkpoint and Transaction Commit (t=72s)
+
+**Component**: Checkpoint Coordinator (on JobMaster)
+
+**Action** (checkpoint triggered every 60s):
+
+**Phase 1: Barrier Injection** (t=60s)
+- Coordinator injects checkpoint barrier #5 into all source operators
+- Barrier flows downstream with events
+
+**Phase 2: State Snapshot** (t=60-65s)
+- Source tasks:
+  - Snapshot Kafka offsets:
+    - `partition-0: offset 120000`
+    - `partition-1: offset 119000`
+    - ... (16 partitions)
+  - Forward barrier to Map
+- Map operator: Snapshot local state (minimal), forward barrier
+- Aggregate operator:
+  - Snapshot RocksDB (500 MB of user states):
+    - `alice: {tx_count_1h: 4, total: 20000}`
+    - `bob: {tx_count_1h: 2, total: 1000}`
+    - ... (1 million users)
+  - Write snapshot to S3: `s3://checkpoints/job-abc123/chk-5/`
+  - Forward barrier to Sink
+- Sink operator:
+  - Snapshot transaction IDs (for idempotency)
+  - Send ACK to Coordinator
+
+**Phase 3: Global Commit** (t=65s)
+- Coordinator receives ACKs from all 64 tasks
+- Declares checkpoint #5 SUCCESS
+- Notifies all sink tasks: "COMMIT transactions"
+
+**Phase 4: Transaction Commit** (t=65-66s)
+- All 16 sink tasks commit their Kafka transactions atomically
+- **ALL alerts from last 60 seconds now visible to consumers**
+  - 10,000 alerts committed in one atomic batch
+
+**State Change**:
+- Checkpoint #5 written to S3 (persistent)
+- All uncommitted Kafka writes → committed
+- Alerts visible to downstream fraud analysts
+
+**WHY 60-Second Checkpoint Interval**:  
+Trade-off between:
+- **Short interval** (10s): Less data loss on failure, but higher overhead (frequent S3 writes)
+- **Long interval** (5 min): Lower overhead, but more data to replay on failure
+- **60s** is typical balance for most workloads
+
+**Timing**: 
+- Checkpoint duration: 5 seconds
+- Alert delivery latency: Up to 60s (buffered until checkpoint)
+- Total end-to-end: **5ms processing + 60s buffering = ~60 seconds**
+
+---
+
+### Bonus: Failure Recovery (t=120s) - TaskManager Crash
+
+**What Happens**:
+
+```
+t=120s: TaskManager-3 crashes (OOM, EC2 spot instance terminated)
+  → 16 tasks lost (Aggregate operator tasks)
+  → Job cannot continue
+
+JobMaster detects failure (via heartbeat timeout):
+  1. Cancels ALL 64 tasks across all TaskManagers
+  2. Requests 1 new TaskManager from Kubernetes (to replace lost one)
+  3. K8s provisions new pod: flink-taskmanager-5 (10 seconds)
+  4. JobMaster restores state from checkpoint #5 (S3):
+     - Kafka offsets: Rewind to offset 120000 (from checkpoint #5)
+     - RocksDB state: Restore alice's counters (tx_count=4)
+  5. Redeploys all 64 tasks
+  6. Source tasks resume reading from offset 120000 (replay)
+
+t=150s: Job RUNNING again (30-second recovery)
+  → Events 120000-132000 reprocessed (2 minutes of data)
+  → Results guaranteed identical (exactly-once replay)
+```
+
+**WHY Full Job Restart**:  
+Consistency. Flink must ensure all operators see consistent state (from checkpoint #5). Can't mix "checkpoint #5 state" with "checkpoint #6 state".
+
+**Recovery Time Breakdown**:
+- Detection: 10s (heartbeat timeout)
+- Provisioning: 10s (K8s pod startup)
+- Restore: 5s (S3 read)
+- Resume: 5s (task deployment)
+- **Total**: 30 seconds
+
+---
+
+### Performance Summary
+
+**Normal Operation**:
+- **Processing Latency**: 5ms (event ingestion → alert generation)
+- **Delivery Latency**: 60s (buffering until checkpoint)
+- **Throughput**: 100,000 transactions/sec (16 partitions * 6,250/sec)
+
+**On Failure**:
+- **Recovery Time**: 30 seconds
+- **Replay**: 2 minutes of data (checkpoint interval * 2)
+- **Guarantee**: Exactly-once (no duplicates, no data loss)
+
+**Resource Utilization**:
+- 4 TaskManagers: 32 GB RAM, 64 CPU cores
+- State size: 500 MB (1M users * 500 bytes/user)
+- Checkpoint size: 500 MB (written to S3 every 60s)
+
+---
+
 
 ## 6. Failure Scenarios (The Senior View)
 
