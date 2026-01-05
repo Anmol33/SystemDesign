@@ -211,14 +211,6 @@ graph LR
 
 ---
 
-### Problem It Solves
-
-- **True stream processing**: Sub-second latency (1-100ms) vs Spark's micro-batching (500ms-5s)
-- **Exactly-once guarantees**: Even for external systems (databases, Kafka) via 2-phase commit
-- **Advanced state management**: TB-scale stateful operations with RocksDB
-- **Event-time processing**: Correct results despite out-of-order events via watermarks
-- **Complex event processing (CEP)**: Pattern matching across event streams
-
 ### Key Differentiator
 
 Flink's **Chandy-Lamport distributed snapshots** enable exactly-once processing without sacrificing throughput. The **credit-based backpressure** system prevents memory explosions, and **unaligned checkpoints** allow sub-second checkpoint completion even under heavy load.
