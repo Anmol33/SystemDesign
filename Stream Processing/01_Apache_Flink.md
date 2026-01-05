@@ -1465,7 +1465,70 @@ When Event C arrives (Alice=$800):
 - **From Input 2**: Transfer $200 pending (waiting for confirmation)
 - **Action**: Execute transfer, wait for balance update, verify
 
-Now the barrier alignment problem makes sense!
+Now you understand what JOIN does! Let's see how it works normally:
+
+---
+
+#### Happy Flow: How JOIN Works Normally (No Checkpoints)
+
+**Question**: "JOIN has to wait for matching events like Z and C, right? Doesn't matter how much Kafka lag there is?"
+
+**Answer**: **Exactly!** Let me show you the normal flow:
+
+```
+Normal operation (no barriers, no checkpoints):
+
+t=1s: Event Z arrives (Transfer $200: Alice → Bob)
+      JOIN state:
+        - Alice balance: $1000 (from earlier Event A)
+        - Pending transfer: $200 (from Event Z)
+      
+      JOIN waits... doesn't matter if Input 1 has lag!
+      
+t=5s: Event C arrives (Alice=$800)
+      JOIN sees:
+        - Balance dropped by $200
+        - We have pending transfer of $200
+        - Match! ✓
+      
+      JOIN concludes: Transfer successful!
+      Output: "Transfer Z verified ✓"
+```
+
+**Key Point**: JOIN **waits for matching events** regardless of lag!
+- Event Z arrives → JOIN stores it, waits
+- Event C arrives 4 seconds later → JOIN matches them
+- **Lag doesn't matter** for normal operation!
+
+---
+
+**Another Example: Extreme Lag**
+
+```
+t=1s: Event Z arrives (Transfer $200)
+      JOIN: "I'll wait for the balance update..."
+      
+t=1min: Still waiting... (Input 1 has 1-minute lag!)
+        
+t=1min: Event C finally arrives (Alice=$800)
+        JOIN: "There it is! Matched ✓"
+```
+
+**Normal operation handles lag perfectly!** JOIN just waits.
+
+---
+
+**So What's the Problem Then?**
+
+Good question! **Normal operation works fine with lag.**
+
+**The problem is CHECKPOINTS!**
+
+Barrier alignment problem is specifically about:
+- **WHEN to snapshot** the JOIN's state
+- Not about how JOIN matches events (that works fine!)
+
+Let's see why checkpoints make this tricky...
 
 ---
 
