@@ -322,35 +322,17 @@ graph LR
     style W1 fill:#99ccff
 ```
 
-**Watermark Example**:
+**How to Configure**:
+1. Choose **out-of-order tolerance** (e.g., 10 seconds)
+2. Flink extracts timestamp from each event
+3. Watermark advances: `current_max_timestamp - tolerance`
+4. When watermark reaches window end → trigger computation
 
+**Example Configuration** (Java):
 ```java
-// Java
 WatermarkStrategy<Event> strategy = WatermarkStrategy
-    .<Event>forBoundedOutOfOrderness(Duration.ofSeconds(10))
-    .withTimestampAssigner((event, timestamp) -> event.getTimestamp());
-
-stream.assignTimestampsAndWatermarks(strategy);
-```
-
-```scala
-// Scala
-val strategy = WatermarkStrategy
-  .forBoundedOutOfOrderness[Event](Duration.ofSeconds(10))
-  .withTimestampAssigner((event, _) => event.timestamp)
-
-stream.assignTimestampsAndWatermarks(strategy)
-```
-
-```python
-# Python (PyFlink)
-from pyflink.datastream import WatermarkStrategy
-
-def extract_timestamp(event):
-    return int(event['timestamp'] * 1000)
-
-watermark_strategy = WatermarkStrategy.for_bounded_out_of_orderness(Duration.of_seconds(10)) \
-    .with_timestamp_assigner(TimestampAssignerWrapper(extract_timestamp))
+    .forBoundedOutOfOrderness(Duration.ofSeconds(10))
+    .withTimestampAssigner((event, ts) -> event.getTimestamp());
 ```
 
 **Meaning**: Allow 10 seconds of out-of-order arrival. After seeing event at T=100, emit watermark W(90) = "No events before T=90 will arrive"
@@ -362,56 +344,38 @@ watermark_strategy = WatermarkStrategy.for_bounded_out_of_orderness(Duration.of_
 **State Types**:
 
 **1. Keyed State** (per key):
-```java
-// Java - ValueState example
-public class CountFunction extends KeyedProcessFunction<String, Event, Tuple2<String, Long>> {
-    private ValueState<Long> count;
-    
-    @Override
-    public void open(Configuration config) {
-        ValueStateDescriptor<Long> descriptor = 
-            new ValueStateDescriptor<>("count", Long.class);
-        count = getRuntimeContext().getState(descriptor);
-    }
-    
-    @Override
-    public void processElement(Event event, Context ctx, Collector<Tuple2<String, Long>> out) {
-        Long current = count.value();
-        if (current == null) current = 0L;
-        count.update(current + 1);
-        out.collect(new Tuple2<>(event.getKey(), current + 1));
-    }
-}
-```
 
-```scala
-// Scala
-class CountFunction extends KeyedProcessFunction[String, Event, (String, Long)] {
-  lazy val count: ValueState[Long] = getRuntimeContext
-    .getState(new ValueStateDescriptor[Long]("count", classOf[Long]))
-  
-  override def processElement(event: Event, ctx: Context, out: Collector[(String, Long)]): Unit = {
-    val current = Option(count.value()).getOrElse(0L)
-    count.update(current + 1)
-    out.collect((event.key, current + 1))
-  }
-}
-```
+Flink maintains state **per key** automatically. Example: Counting events per user.
+
+**How It Works**:
+1. Flink routes events by key to same operator instance
+2. Operator declares state variable (e.g., `ValueState<Long> count`)
+3. On each event:
+   - Read current value from state: `long current = count.value()`
+   - Update: `count.update(current + 1)`
+   - State persisted to RocksDB (off-heap)
+
+**State Varieties**:
+- `ValueState<T>`: Single value per key (e.g., counter, last seen timestamp)
+- `ListState<T>`: List of values per key (e.g., recent events buffer)
+- `MapState<K,V>`: Key-value map per key (e.g., session attributes)
 
 **2. Operator State** (non-keyed):
-- Broadcast state: Same state across all parallel instances
-- List state: Redistributable list elements
+- **Broadcast State**: Same state replicated across all parallel instances
+- **List State**: Redistributable list elements (for source offset tracking)
 
-**Storage: RocksDB**:
+**Storage: RocksDB Architecture**:
 ```
-TaskManager Memory:
+TaskManager Memory Allocation:
 ├─ JVM Heap: 4 GB
-│   └─ User functions, operators
+│   └─ User functions, operators, control plane
 ├─ Off-Heap (Managed): 8 GB
-│   └─ RocksDB state backend
+│   └─ RocksDB state backend (LSM tree on SSD)
 └─ Off-Heap (Network): 2 GB
-    └─ Network buffers
+    └─ Network buffers for shuffle
 ```
+
+**Why Off-Heap**: Avoids JVM garbage collection pauses, can exceed heap size
 
 ---
 
@@ -469,46 +433,35 @@ Checkpoint 5:
 
 ### B. Exactly-Once Sink (2-Phase Commit)
 
-**Challenge**: How to guarantee exactly-once writes to external systems?
+**Challenge**: How to guarantee exactly-once writes to external systems (Kafka, databases)?
 
-**Solution**: 2PC protocol
+**Solution**: Two-Phase Commit (2PC) protocol coordinated with checkpoints
 
 **Phase 1: Pre-commit** (during processing):
-```
-Operator processes events → Sink writes to Kafka as "uncommitted"
-  Kafka transaction: OPEN
-  Messages visible only to this transaction
-```
+1. Sink receives records from operator
+2. Opens transaction in external system (e.g., Kafka transaction)
+3. Writes records as "uncommitted" (invisible to consumers)
+4. Accumulates writes until checkpoint barrier arrives
 
 **Phase 2: Commit** (on checkpoint complete):
-```
-Checkpoint Coordinator: "Checkpoint 5 SUCCESS"
-  → Notify all sinks
-  → Sinks call: kafkaProducer.commitTransaction()
-  → Messages now visible to consumers
-```
+1. Checkpoint Coordinator confirms: "Checkpoint 5 SUCCESS"
+2. Notifies all sinks via RPC
+3. Each sink commits its transaction
+4. Records now visible atomically to external consumers
 
 **Failure Handling**:
-```
-If checkpoint fails:
-  → Sinks call: kafkaProducer.abortTransaction()
-  → Uncommitted messages discarded
-  → Restart from last successful checkpoint
-```
+- **If checkpoint fails**: 
+  - Sink aborts transaction
+  - Uncommitted writes discarded
+  - Flink restarts from last successful checkpoint
+  - Re-processes and re-writes same records (idempotent)
 
-**Code Example**:
+**Configuration** (enable exactly-once):
 ```java
-// Java - Exactly-once Kafka sink
-Properties props = new Properties();
-props.setProperty("transaction.timeout.ms", "900000");  // 15 min
-
-FlinkKafkaProducer<Event> sink = new FlinkKafkaProducer<>(
-    "output-topic",
-    new EventSchema(),
-    props,
-    FlinkKafkaProducer.Semantic.EXACTLY_ONCE  // Enable 2PC
-);
+FlinkKafkaProducer.Semantic.EXACTLY_ONCE  // 2PC enabled
 ```
+
+**Transaction Timeout**: Must exceed checkpoint interval (e.g., 15 minutes for 60s checkpoints)
 
 ---
 
@@ -672,38 +625,24 @@ Result: Kafka lag grows, but job appears "healthy" (no errors)
 
 #### The Fix
 
-**Option 1: Scale Sink Parallelism**:
-```java
-// Increase sink instances
-DataStream<Event> stream = ...;
-stream.sinkTo(sink).setParallelism(10);  // Was 1, now 10
-```
+**Option 1: Scale Sink Parallelism**
+- Increase sink operator parallelism: `sink.setParallelism(10)` (was 1)
+- Distributes load across 10 instances
+- Each handles 10% of traffic → 10× throughput
 
-**Option 2: Async I/O** (Recommended):
-```java
-// Non-blocking database writes
-AsyncDataStream.orderedWait(
-    stream,
-    new AsyncDatabaseFunction(),
-    60000,  // Timeout 60s
-    TimeUnit.MILLISECONDS,
-    100     // Max concurrent requests
-);
+**Option 2: Async I/O** (Recommended)
+- Use non-blocking database writes
+- Allow 100 concurrent requests per operator
+- Prevents blocking while waiting for DB response
+- **Result**: 100× higher throughput (100ms/write but 100 concurrent = 1000 writes/sec)
 
-class AsyncDatabaseFunction extends RichAsyncFunction<Event, Result> {
-    @Override
-    public void asyncInvoke(Event event, ResultFuture<Result> resultFuture) {
-        CompletableFuture.supplyAsync(() -> database.write(event))
-            .thenAccept(result -> resultFuture.complete(Collections.singleton(result)));
-    }
-}
-```
-
-**Option 3: Increase Network Buffers**:
-```yaml
-taskmanager.memory.network.fraction: 0.2  # Was 0.1 (10%), now 20%
-taskmanager.network.numberOfBuffers: 4096  # Increase buffer pool
-```
+**Option 3: Increase Network Buffers**
+- Configuration:
+  ```yaml
+  taskmanager.memory.network.fraction: 0.2  # 20% for network (was 10%)
+  taskmanager.network.numberOfBuffers: 4096  # More buffers
+  ```
+- More buffers = more tolerance for slow downstream
 
 ---
 
@@ -748,29 +687,23 @@ Result: Checkpoint fails, recovery window grows
 
 #### The Fix
 
-**Option 1: Enable Unaligned Checkpoints** (Critical!):
-```yaml
-execution.checkpointing.unaligned: true
-```
+**Option 1: Enable Unaligned Checkpoints** (Critical!)
+- Configuration: `execution.checkpointing.unaligned: true`
+- **How it works**:
+  1. Barrier "jumps ahead" of queued data in buffers
+  2. Snapshots include in-flight buffered records
+  3. Checkpoint completes in milliseconds (doesn't wait for slow task)
+- **Trade-off**: Larger checkpoint size (includes buffered data)
 
-**How it works**:
-- Barrier "jumps ahead" of queued data
-- Snapshots in-flight buffered data as part of checkpoint
-- Checkpoint completes in milliseconds (not waiting for 100 records)
+**Option 2: Fix Data Skew (Key Salting)**
+- **Problem**: 99% of data has same key (e.g., `user_id="bot_123"`)
+- **Solution**: Add random suffix to distribute across subtasks
+  - Before: `keyBy(event -> event.getUserId())` → all to 1 subtask
+  - After: `keyBy(event -> event.getUserId() + "_" + random(0-9))` → spread across 10 subtasks
 
-**Option 2: Fix Data Skew (Salting)**:
-```java
-// BAD: Skewed key (99% of data has user_id="bot_123")
-stream.keyBy(event -> event.getUserId());
-
-// GOOD: Add random suffix to distribute load
-stream.keyBy(event -> event.getUserId() + "_" + (event.hashCode() % 10));
-```
-
-**Option 3: Increase Checkpoint Timeout**:
-```yaml
-execution.checkpointing.timeout: 600000  # 10 min (was 60s)
-```
+**Option 3: Increase Checkpoint Timeout**
+- Configuration: `execution.checkpointing.timeout: 600000` (10 min, was 60s)
+- **When to use**: Temporary fix while investigating skew root cause
 
 ---
 
@@ -856,23 +789,20 @@ Checkpoint triggers:
 
 #### The Fix
 
-**Increase Kafka transaction timeout**:
-```java
-Properties props = new Properties();
-props.setProperty("transaction.timeout.ms", "3600000");  // 1 hour
+**Option 1: Increase Kafka Transaction Timeout**
+- Configuration: `transaction.timeout.ms=3600000` (1 hour, was 15 min)
+- **Why**: Kafka aborts transactions exceeding timeout
+- Must exceed: checkpoint interval + checkpoint duration + buffer
 
-FlinkKafkaProducer<Event> sink = new FlinkKafkaProducer<>(
-    "output",
-    schema,
-    props,
-    FlinkKafkaProducer.Semantic.EXACTLY_ONCE
-);
-```
+**Option 2: Reduce Checkpoint Interval**
+- Configuration: `execution.checkpointing.interval=30000` (30s, was 60s)
+- Shorter interval = faster commits = less likely to timeout
+- **Trade-off**: More frequent checkpoints = 2× overhead
 
-**Also increase checkpoint timeout**:
-```yaml
-execution.checkpointing.timeout: 1800000  # 30 min
-```
+**Option 3: Pre-aggregate Before Sink**
+- Aggregate in Flink before writing to Kafka
+- Example: Write per-minute aggregates instead of raw events
+- **Result**: 60× fewer writes, 60× shorter transaction duration
 
 ---
 
@@ -898,43 +828,29 @@ execution.checkpointing.timeout: 1800000  # 30 min
 ### Scaling Strategies
 
 **1. Horizontal Scaling (Add TaskManagers)**:
-```bash
-# Kubernetes
-kubectl scale deployment flink-taskmanager --replicas=8  # Up from 4
-
-# Result: More CPU for processing, more parallel instances
-```
+- Add more TaskManager pods/instances
+- Example: Scale from 4 to 8 TaskManagers
+- **Result**: 2× CPU capacity, 2× parallel task slots
+- **When**: CPU-bound workloads, need more parallelism
 
 **2. Vertical Scaling (Increase Resources)**:
-```bash
-flink run \
-  --parallelism 32 \
-  --taskmanager-memory 16G \  # Up from 8G
-  --taskmanager-slots 4 \
-  job.jar
-```
+- Increase memory/CPU per TaskManager
+- Example: 8GB → 16GB RAM per TaskManager
+- **Result**: Handle larger state per instance, fewer checkpoints
+- **When**: Memory-bound (large state), avoid too many small instances
 
 **3. State Sharding (Increase Parallelism)**:
-```
-Current:
-  Parallelism = 8
-  State per instance = 10 GB
-  Total state = 80 GB
-
-After:
-  Parallelism = 16
-  State per instance = 5 GB
-  Total state = 80 GB (redistributed)
-  
-Benefit: Faster checkpoint (smaller snapshots per instance)
-```
+- Increase job parallelism (redistribute keys across more subtasks)
+- Example: Parallelism 8 → 16
+  - Before: 10GB state per instance × 8 = 80GB total
+  - After: 5GB state per instance × 16 = 80GB total
+- **Benefit**: Faster checkpoints (smaller snapshots per instance)
+- **Limit**: Cannot exceed Kafka partition count
 
 **4. Operator Chaining Optimization**:
-```java
-// Disable chaining for CPU-heavy operator
-stream
-  .map(new HeavyFunction()).disableChaining()
-  .keyBy(...)
+- Disable chaining for CPU-heavy operators to spread load
+- Configuration: `.disableChaining()` on heavy map/filter
+- **Trade-off**: More network overhead, better parallelism
 ```
 
 ---
