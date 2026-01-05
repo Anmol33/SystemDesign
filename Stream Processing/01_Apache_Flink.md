@@ -447,92 +447,188 @@ If TaskManager crashes:
 
 This separation enables isolation (jobs don't interfere), flexibility (works on K8s/YARN), and resilience (job-level failure recovery).
 
-## 3. How It Works: Time, State, and Watermarks
+## 3. How It Works: Solving Real Problems with Event-Time and State
 
-### A. Event Time vs Processing Time
+**Scenario**: You're building analytics for a mobile shopping app. You want to count "product views per user in 5-minute windows" to detect trending products.
 
-**Challenge**: Events arrive out-of-order
+### The Problem: When Phones Go Offline
+
+**What happens in the real world**:
 
 ```
-Real-world timeline:
-  User in Tokyo tunnel: Generates event at 12:00
-  Network delay: Event arrives at Flink at 12:05
-  
-Processing time: 12:05 (when Flink sees it)
-Event time: 12:00 (when it actually happened)
+10:00 AM: User scrolls on phone, views iPhone case
+          Phone generates event: {user: "alice", product: "case", time: 10:00}
+          
+10:01 AM: User enters subway tunnel (phone offline)
+          Views AirPods, Charger, Cable
+          ALL 3 EVENTS STUCK IN PHONE
+          
+10:06 AM: User exits tunnel (phone reconnects)
+          Phone uploads ALL 4 events at once to server
+          Flink receives events at 10:06 AM
 ```
 
-**Flink's Solution: Watermarks**
+**The Question**: Do these 4 events belong in the **10:00-10:05 window** or the **10:05-10:10 window**?
 
-A watermark `W(T)` is a guarantee: **"No events older than T will arrive"**
-
-```mermaid
-graph LR
-    subgraph StreamFlow["Stream Flow"]
-        E1["Event 12:01"] --> E2["Event 12:02"]
-        E2 --> W1{{"Watermark 12:01"}}
-        W1 --> E3["Event 12:03"]
-        E3 --> E4["Late Event 12:00"]
-    end
-    
-    style E4 fill:#ff9999
-    style W1 fill:#99ccff
-```
-
-**How to Configure**:
-1. Choose **out-of-order tolerance** (e.g., 10 seconds)
-2. Flink extracts timestamp from each event
-3. Watermark advances: `current_max_timestamp - tolerance`
-4. When watermark reaches window end → trigger computation
-
-**Example Configuration** (Java):
-```java
-WatermarkStrategy<Event> strategy = WatermarkStrategy
-    .forBoundedOutOfOrderness(Duration.ofSeconds(10))
-    .withTimestampAssigner((event, ts) -> event.getTimestamp());
-```
-
-**Meaning**: Allow 10 seconds of out-of-order arrival. After seeing event at T=100, emit watermark W(90) = "No events before T=90 will arrive"
+**Two Possible Approaches**:
 
 ---
 
-### B. Stateful Operations (The Power of Flink)
+### Approach 1: Processing Time (WRONG for this use case)
 
-**State Types**:
+**What it means**: Use the time Flink **sees** the events (arrival time)
 
-**1. Keyed State** (per key):
-
-Flink maintains state **per key** automatically. Example: Counting events per user.
-
-**How It Works**:
-1. Flink routes events by key to same operator instance
-2. Operator declares state variable (e.g., `ValueState<Long> count`)
-3. On each event:
-   - Read current value from state: `long current = count.value()`
-   - Update: `count.update(current + 1)`
-   - State persisted to RocksDB (off-heap)
-
-**State Varieties**:
-- `ValueState<T>`: Single value per key (e.g., counter, last seen timestamp)
-- `ListState<T>`: List of values per key (e.g., recent events buffer)
-- `MapState<K,V>`: Key-value map per key (e.g., session attributes)
-
-**2. Operator State** (non-keyed):
-- **Broadcast State**: Same state replicated across all parallel instances
-- **List State**: Redistributable list elements (for source offset tracking)
-
-**Storage: RocksDB Architecture**:
+**Result**:
 ```
-TaskManager Memory Allocation:
-├─ JVM Heap: 4 GB
-│   └─ User functions, operators, control plane
-├─ Off-Heap (Managed): 8 GB
-│   └─ RocksDB state backend (LSM tree on SSD)
-└─ Off-Heap (Network): 2 GB
-    └─ Network buffers for shuffle
+All 4 events arrived at 10:06 AM
+→ Go into 10:05-10:10 window
+→ 10:00-10:05 window shows 0 views
+→ WRONG! User actually viewed during 10:00-10:05
 ```
 
-**Why Off-Heap**: Avoids JVM garbage collection pauses, can exceed heap size
+**Problem**: Network delays make data incorrect
+- User was active 10:00-10:05 but analytics show zero activity
+- 10:05-10:10 window shows spike that didn't actually happen
+
+---
+
+### Approach 2: Event Time (CORRECT - What Flink Does)
+
+**What it means**: Use the time events **actually happened** (embedded in event data)
+
+**How Flink handles it**:
+```
+Event 1: {user: "alice", product: "case", time: 10:00}
+→ Extract timestamp: 10:00 AM
+→ Place in 10:00-10:05 window
+
+Event 2: {user: "alice", product: "airpods", time: 10:01}
+→ Extract timestamp: 10:01 AM  
+→ Place in 10:00-10:05 window
+
+... and so on
+```
+
+**Result**:
+```
+10:00-10:05 window: 4 views (CORRECT!)
+10:05-10:10 window: 0 views (CORRECT!)
+```
+
+**Key Insight**: Flink gets the right answer even though events arrived late
+
+---
+
+### But Wait... When is the Window "Done"?
+
+**The Challenge**: Flink processes events at 10:06. Should it:
+- Wait longer? Maybe more 10:00-10:05 events will arrive?
+- Close the window? Risk missing late events?
+
+**This is where Watermarks come into play...**
+
+---
+
+### Watermarks: Tracking Event-Time Progress
+
+**What is a Watermark?**: A special marker saying **"No events older than T will arrive"**
+
+**How Flink Uses Them**:
+
+```
+Flink processing stream:
+
+Event {time: 10:00} arrives
+Event {time: 10:01} arrives  
+Event {time: 10:03} arrives
+
+Watermark(10:00) flows through → "No events before 10:00 will arrive"
+
+Event {time: 10:04} arrives
+Event {time: 10:05} arrives
+
+Watermark(10:05) flows through → "No events before 10:05 will arrive"
+
+→ Flink TRIGGERS 10:00-10:05 window computation
+→ Emits result: (alice, 4 views)
+```
+
+**Watermark Configuration** (allowing 2-minute delay tolerance):
+1. Flink sees event with timestamp 10:05
+2. Calculates: "Latest timestamp = 10:05, tolerance = 2 minutes"
+3. Emits: Watermark(10:03) = "No events before 10:03 will arrive"
+4. When Watermark reaches window end (10:05), trigger computation
+
+---
+
+### Handling Late Events
+
+**What if event arrives AFTER watermark passed?**
+
+```
+Watermark(10:05) already passed
+10:00-10:05 window already computed and emitted result
+
+Late Event {time: 10:02} arrives at 10:08 AM (very late!)
+```
+
+**Flink Options**:
+1. **Drop it** (if window already closed)
+2. **Allow late events** with configured grace period
+   - Example: Allow up to 1 minute late
+   - Update previous result (emit correction)
+3. **Send to side output** (dead letter queue for analysis)
+
+---
+
+### Stateful Processing: Remembering User Activity
+
+**Back to our scenario**: We need to track "views per user"
+
+**The Problem**: Events for one user arrive at different TaskManagers
+```
+alice's event 1 → TaskManager 1
+alice's event 2 → TaskManager 2
+```
+
+**Flink's Solution: Keyed State**
+
+**Step 1: Key By User**
+```
+Flink routes ALL events with key="alice" → Same TaskManager instance
+```
+
+**Step 2: Maintain State Per User**
+```
+TaskManager 1 has local state:
+{
+  "alice": {count: 4, last_seen: 10:05},
+  "bob": {count: 2, last_seen: 10:03}
+}
+```
+
+**Step 3: Process Event**
+```
+New event arrives: {user: "alice", product: "case", time: 10:06}
+
+1. Flink routes to TaskManager 1 (alice's owner)
+2. Reads alice's state: count=4
+3. Increments: count=5
+4. Writes back to RocksDB
+5. State persisted (survives crashes)
+```
+
+---
+
+### Why Off-Heap RocksDB?
+
+**The Challenge**: User state can be HUGE
+- 10 million users
+- Each user has activity history
+- Total: 100GB of state
+
+**JVM Heap Problem**:
+
 
 ---
 
