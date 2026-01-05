@@ -10,6 +10,11 @@
 - **Data Locality**: Moves the computation to the data (the code travels to the node holding the HDD block).
 - **Linear Scalability**: Add more nodes = linear increase in speed/capacity.
 
+**Industry Adoption**:
+- **Yahoo**: First major adopter (2008), processing 100+ PB
+- **Facebook**: Used for data warehouse until 2014
+- **LinkedIn**: Hadoop clusters with 10,000+ nodes
+
 **Use Case**:
 - Massive archival ETL (Extract, Transform, Load).
 - Log analysis (web server logs).
@@ -24,7 +29,7 @@ In modern Hadoop (v2+), MapReduce runs as an application on top of **YARN** (Yet
 ```mermaid
 graph TD
     subgraph Client
-        JobClient["Job Client<br/>(Submits Jar)"]
+        JobClient["Job Client (Submits Jar)"]
     end
 
     subgraph YARN_Master["ResourceManager (Master)"]
@@ -33,7 +38,7 @@ graph TD
     end
 
     subgraph Worker_Node_1["NodeManager 1"]
-        AM["AppMaster<br/>(Coordinates Job)"]
+        AM["AppMaster (Coordinates Job)"]
         Map1["Map Task Container"]
         Map2["Map Task Container"]
     end
@@ -79,39 +84,240 @@ The life of a MapReduce job follows a strict 3-phase structure:
 
 ---
 
-## 4. End-to-End Walkthrough: Word Count (Java)
+## 4. Deep Dive: The Shuffle Mechanics
 
-This examples shows the actual boilerplate-heavy Java code required to write a MapReduce job.
+The shuffle is where Hadoop spends 70% of its time. Understanding it is critical for performance tuning.
 
-### The Mapper
-Input: `(LongWritable offset, Text line)` -> Output: `(Text word, IntWritable one)`
+### A. Shuffle State Machine
 
+```mermaid
+stateDiagram-v2
+    [*] --> MapOutput: Record Emitted
+    MapOutput --> Buffering: Write to Buffer
+    Buffering --> Spilling: Buffer 80% Full
+    Spilling --> Buffering: Spill Complete
+    Buffering --> Merging: Map Task Complete
+    Merging --> Partitioned: All Spills Merged
+    Partitioned --> Fetching: Reducer Connects
+    Fetching --> Merging_Reduce: All Map Outputs Fetched
+    Merging_Reduce --> Sorted: Final Merge Complete
+    Sorted --> [*]: Ready for Reduce
+    
+    state Buffering {
+        [*] --> Writing
+        Writing --> InMemorySort: Threshold Reached
+    }
+    
+    state Spilling {
+        [*] --> Partition
+        Partition --> QuickSort
+        QuickSort --> DiskWrite
+    }
+```
+
+### B. Map Side: Buffer & Spill
+
+Mappers do not write directly to disk. They write to a **Circular In-Memory Buffer**.
+
+**Buffer Configuration**:
+```
+Buffer Size = mapreduce.task.io.sort.mb (Default: 100MB)
+Spill Threshold = Buffer × mapreduce.map.sort.spill.percent (Default: 0.80)
+Usable Buffer = 100MB × 0.80 = 80MB
+Reserve = 20MB (continues accepting records during spill)
+```
+
+**Memory Pressure Example**:
+- Mapper generates 500MB of output
+- Buffer holds 80MB before spilling
+- Number of spills = ⌈500MB / 80MB⌉ = 7 spills
+- Each spill = 1 disk write operation
+- **Total disk writes**: 7 spills + 1 merge = 8  writes
+- **Fix**: Increase `io.sort.mb` to 200MB → reduces to 3 spills + 1 merge = 4  writes
+
+**The Spill Process** (Step-by-Step):
+1.  **Detect**: Background thread monitors buffer at 80% full (80MB used)
+2.  **Partition**: Sort records by `(partition_id, key)` using in-memory quicksort
+    - Partition function: `hash(key) % num_reducers`
+    - Sort complexity: $O(N \log N)$ where N = records in buffer
+3.  **Combiner** (Optional): Run local aggregation to reduce data volume
+    - Example: `(the, 1), (the, 1), (the, 1)` → `(the, 3)`
+    - Reduces network traffic by 60-90%
+4.  **Write**: Flush sorted partition segments to disk: `spill_0.out`
+    - Disk write speed: ~100MB/s (HDD sequential write)
+    - Time: 80MB / 100MB/s = 0.8 seconds
+
+**Map Completion Merge**:
+- When map task finishes, merge all spill files: `spill_0.out`, `spill_1.out`, ..., `spill_6.out`
+- Uses multi-way merge (merges all simultaneously)
+- Output: Single partitioned file per mapper
+- Each partition is internally sorted
+
+### C. Reduce Side: Fetch & Merge
+
+**Fetch Phase**:
+```
+Configuration:
+  mapreduce.reduce.shuffle.parallelcopies = 5 (default)
+  
+Mechanism:
+  Reducer launches 5 HTTP threads
+  Each thread fetches from different mapper:
+    Thread 1: GET http://mapper_1:13562/mapOutput?partition=3
+    Thread 2: GET http://mapper_2:13562/mapOutput?partition=3
+    ...
+  
+Data accumulation:
+  If partition < 25% of reducer memory: Keep in RAM
+  Else: Spill to disk
+```
+
+**Merge Sort Algorithm** (K-way merge, K = number of mappers):
+
+**Step 1**: Open K files simultaneously
+```
+Files: mapper_1_partition_3.out, mapper_2_partition_3.out, ..., mapper_K_partition_3.out
+Assumption: K = 1000 mappers
+```
+
+**Step 2**: Read first key from each file
+```
+File 1: key="apple", position=0
+File 2: key="banana", position=0
+...
+File 1000: key="zebra", position=0
+```
+
+**Step 3**: Select minimum key
+```
+Min-heap of 1000 keys
+Extract min: "apple" from File 1
+Write to output
+Advance File 1 pointer, read next key
+Insert new key into heap
+```
+
+**Step 4**: Repeat until all files exhausted
+```
+Complexity: O(N log K)
+  N = total records across all files
+  K = 1000 mappers
+  Each heap operation: O(log K) = O(log 1000) ≈ 10 comparisons
+```
+
+**Multi-Level Merge** (if K > merge factor):
+```
+Default merge factor = 10 (configurable via mapreduce.task.io.sort.factor)
+
+If K = 1000:
+  Level 1: Merge 100 batches of 10 files → 100 intermediate files
+  Level 2: Merge 10 batches of 10 files → 10 intermediate files  
+  Level 3: Merge 1 batch of 10 files → 1 final file
+  
+Total passes: log₁₀(1000) = 3 passes
+```
+
+### D. Disk I/O Quantification
+
+**HDD Performance Characteristics**:
+- Sequential Read: 120 MB/s
+- Sequential Write: 100 MB/s
+- Random Read IOPS: 100 IOPS (10ms seek time)
+- Random Write IOPS: 100 IOPS
+
+**MapReduce Disk Usage**:
+```
+Scenario: Process 10GB file with 100 mappers
+
+Map Phase:
+  Read input: 10GB / 120MB/s = 83 seconds
+  Spill writes: 10GB × (spill_count / map_count) = 10GB × 7 / 100 ≈ 700MB per mapper
+  Total spill time: 700MB / 100MB/s = 7 seconds per mapper
+  
+Shuffle Phase:
+  Network transfer (not disk)
+  
+Reduce Phase:
+  Merge reads: 10GB / 120MB/s = 83 seconds (sequential)
+  Output write: 1GB / 100MB/s = 10 seconds (with 3x HDFS replication = 30 seconds)
+  
+Total I/O Time: 83 + 7 + 83 + 30 = 203 seconds
+```
+
+**Why Spark is Faster**:
+- Spark keeps intermediate data in OS page cache (memory)
+- Avoids map-side spills entirely if enough RAM
+- Hadoop: 3-7 disk writes per record
+- Spark: 0-1 disk writes per record (only final output)
+
+---
+
+## 5. End-to-End Walkthrough: Word Count Job
+
+**Scenario**: Count word occurrences in 1TB log file using 50-node cluster
+
+### Timeline Visualization
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant RM as ResourceManager
+    participant AM as ApplicationMaster
+    participant M1 as Mapper 1
+    participant R1 as Reducer 1
+    participant HDFS
+    
+    Note over Client,HDFS: Job Submission (t=0s)
+    Client->>RM: Submit WordCount.jar
+    RM->>AM: Allocate Container
+    AM->>RM: Request 8000 Map containers
+    
+    Note over Client,HDFS: Map Phase (t=10s - t=120s)
+    RM->>M1: Launch Map Task (Block 0)
+    M1->>HDFS: Read 128MB block (2s)
+    M1->>M1: Tokenize & emit (word,1) (1s)
+    M1->>M1: Spill to disk (0.8s × 3 spills = 2.4s)
+    M1->>M1: Merge spills (0.5s)
+    M1->>AM: Map Complete
+    
+    Note over Client,HDFS: Shuffle (t=120s - t=180s)
+    R1->>M1: HTTP GET /mapOutput?partition=1
+    R1->>R1: Fetch from all 8000 mappers (60s)
+    R1->>R1: Merge sort 8000 streams (10s)
+    
+    Note over Client,HDFS: Reduce (t=180s - t=200s)
+    R1->>R1: Aggregate counts (15s)
+    R1->>HDFS: Write output (3× replication, 5s)
+    R1->>AM: Reduce Complete
+    AM->>Client: Job SUCCESS
+```
+
+### Java Code Implementation
+
+**The Mapper**:
 ```java
 public class TokenizerMapper extends Mapper<Object, Text, Text, IntWritable> {
-
     private final static IntWritable one = new IntWritable(1);
     private Text word = new Text();
 
-    public void map(Object key, Text value, Context context) throws IOException, InterruptedException {
+    public void map(Object key, Text value, Context context) 
+        throws IOException, InterruptedException {
         StringTokenizer itr = new StringTokenizer(value.toString());
         while (itr.hasMoreTokens()) {
             word.set(itr.nextToken());
-            // Write to context: (Word, 1)
-            context.write(word, one);
+            context.write(word, one);  // Writes to in-memory buffer
         }
     }
 }
 ```
 
-### The Reducer
-Input: `(Text word, Iterator<IntWritable> counts)` -> Output: `(Text word, IntWritable sum)`
-
+**The Reducer**:
 ```java
 public class IntSumReducer extends Reducer<Text, IntWritable, Text, IntWritable> {
-
     private IntWritable result = new IntWritable();
 
-    public void reduce(Text key, Iterable<IntWritable> values, Context context) throws IOException, InterruptedException {
+    public void reduce(Text key, Iterable<IntWritable> values, Context context) 
+        throws IOException, InterruptedException {
         int sum = 0;
         for (IntWritable val : values) {
             sum += val.get();
@@ -122,19 +328,27 @@ public class IntSumReducer extends Reducer<Text, IntWritable, Text, IntWritable>
 }
 ```
 
-### The Driver (Configuration)
-
+**The Driver (Configuration)**:
 ```java
 public static void main(String[] args) throws Exception {
     Configuration conf = new Configuration();
-    Job job = Job.getInstance(conf, "word count");
     
+    // Performance tuning
+    conf.set("mapreduce.task.io.sort.mb", "200");  // Increase buffer
+    conf.set("mapred
+
+uce.map.output.compress", "true");     // Enable compression
+    conf.set("mapreduce.map.output.compress.codec", 
+             "org.apache.hadoop.io.compress.SnappyCodec");
+    
+    Job job = Job.getInstance(conf, "word count");
     job.setJarByClass(WordCount.class);
     
     // Set Classes
     job.setMapperClass(TokenizerMapper.class);
-    job.setCombinerClass(IntSumReducer.class); // Local aggregation
+    job.setCombinerClass(IntSumReducer.class);  // Local aggregation
     job.setReducerClass(IntSumReducer.class);
+    job.setNumReduceTasks(100);  // Explicit reducer count
     
     // Set Output Types
     job.setOutputKeyClass(Text.class);
@@ -148,43 +362,122 @@ public static void main(String[] args) throws Exception {
 }
 ```
 
----
+### Detailed Step Breakdown
 
-## 5. Deep Dive: The Shuffle Mechanics
+#### Step 1: Job Submission (t=0 - t=2s)
+- **Component**: Client → ResourceManager
+- **Action**: Upload JAR to HDFS, submit job configuration
+- **State**: Job ID assigned, moves to ACCEPTED queue
+- **Timing**: 2 seconds (JAR upload + metadata)
 
-The shuffle is where Hadoop spends 70% of its time. It is heavily tuned via `mapred-site.xml`.
+#### Step 2: ApplicationMaster Launch (t=2s - t=10s)
+- **Component**: ResourceManager → NodeManager #1
+- **Action**: Allocate container for ApplicationMaster JVM
+- **State**: AM starts, reads job configuration
+- **Timing**: 8 seconds (JVM startup overhead)
 
-### Map Side: Buffer & Spill
-Mappers do not write directly to disk. They write to a **Circular In-Memory Buffer**.
+#### Step 3: Input Split Calculation (t=10s - t=11s)
+- **Component**: ApplicationMaster
+- **Action**: Calculate splits from HDFS
+  ```
+  File size: 1TB = 1,048,576 MB
+  Block size: 128MB
+  Splits: 1TB / 128MB = 8,192 map tasks
+  ```
+- **Timing**: 1 second (HDFS metadata scan)
 
-*   `mapreduce.task.io.sort.mb` (Default: 100MB): Size of the buffer.
-*   `mapreduce.map.sort.spill.percent` (Default: 0.80): When buffer is 80% full, background thread starts spilling.
+#### Step 4: Map Container Allocation (t=11s - t=20s)
+- **Component**: ApplicationMaster → ResourceManager → NodeManagers
+- **Action**: Request 8,192 containers across 50 nodes
+  - Concurrent maps per node: 8 (assuming 8 cores)
+  - Waves: 8,192 / (50 × 8) = 21 waves
+- **Timing**: 9 seconds (container negotiation)
 
-**The Spill Process**:
-1.  **Partition**: Determine which reducer each record goes to.
-2.  **Sort**: In-memory quicksort by Key.
-3.  **Combiner**: Run optional local aggregation.
-4.  **Write**: Flush sorted segment to local disk.
+#### Step 5: Map Execution (t=20s - t=120s)
+- **Component**: Map tasks (8 concurrent per node)
+- **Per-Task Breakdown**:
+  1. Read HDFS block (128MB): 128MB / 64MB/s = 2 seconds
+  2. Tokenize & emit pairs: 1 second (CPU-bound)
+  3. Spill to disk (3 spills): 3 × 0.8s = 2.4 seconds
+  4. Final merge: 0.5 seconds
+  - **Total per task**: 5.9 seconds
+- **Wave timing**: 5.9s × 21 waves = 124 seconds (but overlapped, actual ~100s)
+- **Output**: 1TB of intermediate `(word, 1)` pairs
 
-### Reduce Side: Merge
-Reducers run HTTP threads to fetch map outputs.
+#### Step 6: Shuffle - Fetch (t=120s - t=180s)
+- **Component**: 100 Reducer tasks
+- **Action**: Each reducer fetches its partition from all 8,192 mappers
+  ```
+  Data per reducer: 1TB / 100 = 10GB
+  Parallel fetches: 5 threads per reducer
+  Per-thread bandwidth: 10GB / 5 / 60s = 34MB/s
+  ```
+- **Network**: 50 nodes × 1Gbps = 50Gbps aggregate
+- **Timing**: 60 seconds (network-bound)
 
-*   `mapreduce.reduce.shuffle.parallelcopies`: Threads per reducer to fetch data (Default: 5).
-*   **Merge**: The reducer performs a multi-pass merge sort on disk to create a single iterable stream.
+#### Step 7: Shuffle - Merge (t=180s - t=190s)
+- **Component**: Reducer tasks
+- **Action**: K-way merge of 8,192 sorted streams
+- **Merge levels**: log₁₀(8192) = 4 levels
+- **Timing**: 10 seconds (I/O-bound, disk reads)
+
+#### Step 8: Reduce Execution (t=190s - t=205s)
+- **Component**: Reducer tasks
+- **Action**: Aggregate word counts
+  ```java
+  reduce("the", [1,1,1,...,1]) -> ("the", 5000000000)
+  ```
+- **Timing**: 15 seconds (CPU summing)
+
+#### Step 9: HDFS Write (t=205s - t=210s)
+- **Component**: Reducers → HDFS
+- **Action**: Write 100 output files with 3× replication
+  - Output size: ~5GB (unique words + counts, compressed)
+  - Write: 5GB × 3 / 100MB/s = 150s total / 100 reducers = 1.5s per reducer
+- **Timing**: 5 seconds
+
+#### Step 10: Job Completion (t=210s)
+- **Component**: ApplicationMaster → ResourceManager → Client
+- **Action**: Mark job SUCCESS, release containers, cleanup
+- **State**: Output files available at specified path
+
+### Performance Summary
+
+| Phase | Duration | Bottleneck |
+|:------|:---------|:-----------|
+| Submission & Setup | 20s | JVM startup |
+| Map Processing | 100s | Disk I/O (reading + spilling) |
+| Shuffle Fetch | 60s | Network bandwidth |
+| Shuffle Merge | 10s | Disk I/O (merge sort) |
+| Reduce Aggregation | 15s | CPU (summing) |
+| Output Write | 5s | HDFS replication |
+| **Total** | **210s (3.5 min)** | **Map + Shuffle = 160s** |
 
 ---
 
 ## 6. Failure Scenarios
 
 ### Scenario A: Task Failure
-*   **Symptom**: A single map or reduce task throws a RuntimeException or times out.
-*   **Mechanism**: ApplicationMaster notices task failure. It **Reschedules** the task on a different node.
-*   **Limit**: `mapreduce.map.maxattempts` (Default: 4). If a task fails 4 times, the whole job completely fails.
+*   **Symptom**: `RuntimeException` or timeout in map/reduce task
+*   **Mechanism**: ApplicationMaster detects failure → reschedules on different node
+*   **Configuration**: `mapreduce.map.maxattempts=4` (default)
+*   **Outcome**: If task fails 4 times → entire job fails
 
 ### Scenario B: Stragglers (The "Long Tail")
-*   **Symptom**: 999 tasks finish in 5 mins. 1 task takes 1 hour.
-*   **Cause**: Bad disk, overloaded CPU on one specific node.
-*   **Fix**: **Speculative Execution**. The AM notices the slow task and launches a *duplicate* on a fast node. The first one to finish wins; the other is killed.
+*   **Symptom**: 999 tasks finish in 5 min, 1 task takes 60 min
+*   **Cause**: Bad disk/CPU on specific node
+*   **Fix**: **Speculative Execution**
+    - AM launches duplicate task on healthy node
+    - First to complete wins, other is killed
+    - Enable: `mapreduce.map.speculative=true`
+
+### Scenario C: Out of Memory During Shuffle
+*   **Symptom**: `Container killed by YARN for exceeding memory limits`
+*   **Cause**: Reducer trying to hold all fetched data in RAM
+*   **Fix**: 
+    - Increase `mapreduce.reduce.memory.mb` from 2GB to 4GB
+    - Reduce `mapreduce.reduce.shuffle.input.buffer.percent` from 0.70 to 0.50
+    - Forces earlier spill to disk
 
 ---
 
@@ -195,16 +488,20 @@ Reducers run HTTP threads to fetch map outputs.
 | `mapreduce.map.memory.mb` | 2048 - 4096 | Heap size for Mapper JVM. Prevent OOM. |
 | `mapreduce.task.io.sort.mb` | 250 - 500 | Increase buffer size to prevent frequent disk spills. |
 | `mapreduce.map.output.compress` | true | **Always Enable**. Snappy compresses intermediate data, reducing Network I/O. |
-| `mapreduce.job.reduces` | 0.95 * Nodes * Cores | Set right number of reducers. Too few = OOM. Too many = Small files. |
+| `mapreduce.job.reduces` | 0.95 × Nodes × Cores | Set right number of reducers. Too few = OOM. Too many = Small files. |
+| `mapreduce.task.io.sort.factor` | 50 - 100 | Merge factor for external sort. Higher = fewer merge passes. |
 
 ---
 
 ## 8. Constraints & Limitations
 
-1.  **Disk I/O Intensity**: Every Map step must materialize output to disk. Chain 3 jobs (Map -> Reduce -> Map -> Reduce), and you hit disk 6 times.
-2.  **Java Verbosity**: Writing simple logic requires pages of boilerplate wrapper code.
-3.  **High Latency**: JVM startup time overhead (seconds) makes it unsuitable for short queries.
-4.  **Batch Only**: Cannot handle streaming data.
+| Constraint | Limit | Why? |
+| :--- | :--- | :--- |
+| **Disk I/O Intensity** | 3-7 writes per record | Every map must materialize to disk |
+| **Java Verbosity** | 50+ lines for simple jobs | Boilerplate-heavy API |
+| **High Latency** | 10-30 second JVM startup | Unsuitable for interactive queries |
+| **Batch Only** | No streaming support | Designed for bounded datasets |
+| **Shuffle Overhead** | 30-50% of job time | All-to-all network communication |
 
 ---
 
@@ -216,14 +513,63 @@ Reducers run HTTP threads to fetch map outputs.
 | **Legacy Maintenance** | ✅ **Yes** | Many companies have stable MapReduce pipelines running for 10 years. |
 | **Simple Archival ETL** | ✅ **Yes** | If you just need to move/convert PB of data once a month efficiently. |
 | **Machine Learning** | ❌ **No** | Iterative algorithms are impossibly slow due to disk writes. Use Spark. |
+| **Low-Memory Clusters** | ✅ **Yes** | Hadoop works with 2GB RAM/node. Spark needs 8GB+. |
 
 ---
 
 ## 10. Production Checklist
 
 1.  [ ] **Enable Compression**: Set `mapreduce.map.output.compress=true` (Snappy).
-2.  [ ] **Tune Sort Buffer**: Increase `io.sort.mb` to reducing spilling.
-3.  [ ] **Set Reducers**: Explicitly calculate `numReducers`. Don't use default (1).
-4.  [ ] **Reuse JVMs**: Enable JVM reuse if tasks are very short.
-5.  [ ] **Handle Skew**: Use a custom Partitioner if keys are uneven.
-6.  [ ] **Monitor Spills**: Watch for "Spilled Records" counter. If high, add RAM.
+2.  [ ] **Tune Sort Buffer**: Increase `io.sort.mb` to 200-500MB to reduce spilling.
+3.  [ ] **Set Reducers**: Explicitly calculate `numReducers = nodes × cores × 0.95`. Don't use default (1).
+4.  [ ] **Reuse JVMs**: Enable `mapreduce.job.jvm.numtasks` if tasks are short.
+5.  [ ] **Handle Skew**: Use custom `Partitioner` if keys are unevenly distributed.
+6.  [ ] **Monitor Spills**: Watch "Spilled Records" counter. If > 10%, add RAM.
+7.  [ ] **Enable Speculative Execution**: Set `mapreduce.map.speculative=true` for heterogeneous clusters.
+8.  [ ] **Set Data Locality**: Ensure `mapreduce.job.maps` matches HDFS block count for optimal locality.
+
+**Critical Metrics**:
+
+```
+mapreduce_spilled_records_total:
+  Description: Count of records written to disk during map-side spills
+  Target: < 10% of total map output records
+  Alert: if > 20%
+  Why it matters: High spills = insufficient memory → 10x slower performance
+  Fix: Increase mapreduce.task.io.sort.mb
+
+mapreduce_speculative_tasks_total:
+  Description: Count of speculative task launches
+  Target: < 5% of total tasks
+  Alert: if > 15%
+  Why it matters: High speculation = cluster heterogeneity or failing nodes
+  Fix: Investigate slow nodes, check disk/network health
+
+mapreduce_failed_tasks_total:
+  Description: Count of task failures (before max attempts)
+  Target: < 1% of total tasks
+  Alert: if > 5%
+  Why it matters: Frequent failures = code bugs or resource constraints
+  Fix: Check logs for OutOfMemoryError, increase container memory
+
+mapreduce_shuffle_bytes_total:
+  Description: Total bytes transferred during shuffle phase
+  Target: Monitor for capacity planning
+  Alert: if > 10× input size (indicates compression issues)
+  Why it matters: Large shuffle = network bottleneck
+  Fix: Enable/verify compression with Snappy
+
+mapreduce_gc_time_milliseconds:
+  Description: Time spent in Garbage Collection across all tasks
+  Target: < 10% of task duration
+  Alert: if > 20%
+  Why it matters: Excessive GC = memory pressure
+  Fix: Increase JVM heap size
+
+mapreduce_data_locality_ratio:
+  Description: Ratio of data-local map tasks to total map tasks
+  Target: > 80%
+  Alert: if < 50%
+  Why it matters: Low locality = network overhead for reading HDFS
+  Fix: Increase mapreduce.jobtracker.taskscheduler.maxrunningtasks.perjob
+```
