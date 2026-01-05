@@ -1053,6 +1053,138 @@ Input 2 (slow): Events 1, 2, 3, 4, 5, 6, 7, BARRIER #5
 - Without blocking: State snapshot includes events after barrier = inconsistent
 - With blocking: State snapshot includes ONLY pre-barrier events = consistent
 
+**But WHY is mixing timeline inconsistent?** Let's see a concrete example:
+
+---
+
+#### Concrete Example: Bank Transfer ($200 Duplication Problem)
+
+**Setup**: JOIN operator merging two Kafka topics:
+
+```
+Account Updates (Topic 1) ───┐
+                              ├──→ [JOIN] → Update Balances
+Transfer Events (Topic 2) ───┘
+```
+
+**Events Timeline**:
+
+```
+INPUT 1 (Account Updates - fast):
+  A1: Alice=$1000, Bob=$500
+  A2: Alice=$1000, Bob=$500 (status check)
+  BARRIER #5 arrives at t=1s
+  A3: Alice=$800, Bob=$700   ← $200 transfer happened
+  A4: (more updates...)
+
+INPUT 2 (Transfer Events - slow due to lag):
+  T1:Transfer $100 (Charlie → David)
+  T2: Transfer $200 (Alice → Bob)  ← THE $200 TRANSFER
+  T3: Transfer $50 (Eve → Frank)
+  BARRIER #5 arrives at t=3s
+```
+
+---
+
+**WITHOUT Blocking - Money Duplicates!**
+
+```
+t=1s: See BARRIER from Input 1
+      → Take snapshot immediately
+      → Snapshot: Alice=$1000, Bob=$500 (last from A2)
+      
+t=2s: Process A3 (Alice=$800, Bob=$700)
+      → Already past snapshot!
+      
+t=3s: See BARRIER from Input 2
+      → Input 2 snapshot includes up to T3
+      → But Input 1 already processed A3!
+```
+
+**The Disaster**:
+1. Snapshot captured: Alice=$1000, Bob=$500
+2. But Input 2 hasn't seen Transfer T2 yet!
+3. **On restore**: Flink replays from snapshot
+   - Restores: Alice=$1000, Bob=$500
+   - Re-processes Transfer T2: Alice loses $200, Bob gains $200
+   - Result: Alice=$800, Bob=$700
+   - **BUT** Transfer T2 already happened once (Event A3 showed Alice=$800)!
+   - **Net effect**: Alice=$600, Bob=$900 (transfer happened TWICE!)
+
+**Money created out of thin air!** This is data corruption.
+
+---
+
+**WITH Blocking - Correct!**
+
+```
+t=1s: See BARRIER from Input 1
+      → BLOCK Input 1 (buffer A3, A4 in memory, DON'T process)
+      → Continue Input 2 (process T2, T3)
+      
+t=3s: See BARRIER from Input 2
+      → BOTH inputs at barrier point now
+      → Take snapshot:
+          Input 1: Last processed = A2 (Alice=$1000, Bob=$500)
+          Input 2: Last processed = T3 (includes T2)
+      → UNBLOCK Input 1
+      → Process buffered A3, A4
+```
+
+**Why It Works**:
+1. Snapshot captured: Alice=$1000, Bob=$500 (before T2)
+2. Input 2 snapshot includes T2 (transfer queued)
+3. **On restore**: Flink replays from snapshot
+   - Restores: Alice=$1000, Bob=$500
+   - Processes Transfer T2 ONCE: Alice=$800, Bob=$700
+   - **Correct!**
+
+**Snapshot is consistent** - both inputs at same logical time (before T2 processed).
+
+---
+
+#### Visual: The Timeline Problem
+
+**WITHOUT Blocking**:
+```
+Input 1:  [A1][A2][BARRIER][A3 PROCESSED]
+                    ↓
+                Snapshot (Alice=$1000)
+Input 2:  [T1][T2 NOT YET SEEN][T3]...[BARRIER]
+                                          ↓
+                                    Snapshot late
+
+Snapshot says: "Alice has $1000, and T2 hasn't happened yet"
+Reality: A3 shows Alice=$800 (T2 already applied)
+= INCONSISTENT!
+```
+
+**WITH Blocking**:
+```
+Input 1:  [A1][A2][BARRIER]──BLOCKED──>[A3 BUFFERED, not processed]
+                    ↓
+                Snapshot (Alice=$1000)
+Input 2:  [T1][T2][T3]──continues──>[BARRIER]
+                                        ↓
+                                    Snapshot
+
+BOTH at barrier → Snapshot (Alice=$1000, T2 queued) → Unblock → Process A3
+= CONSISTENT!
+```
+
+---
+
+#### Key Insight
+
+**The blocking ensures**: Snapshot represents a single point in time across ALL inputs, not a mix of different times.
+
+**Real-world impact**:
+- **Kafka lag**: If Input 2 is 10 minutes behind, Input 1 blocks for 10 minutes
+- **Memory**: Buffered events consume RAM (can cause OOM if lag too large)
+- **Latency**: Entire job slowed by slowest input
+
+**Production fix**: Monitor Kafka partition lag, keep inputs balanced!
+
 ---
 
 ### Checkpoint Flow Diagram
