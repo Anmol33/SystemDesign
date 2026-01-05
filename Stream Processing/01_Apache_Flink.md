@@ -1257,20 +1257,47 @@ This is CONSISTENT:
 
 ### Barrier Alignment: Ensuring Consistency
 
-**Challenge**: Operator has multiple inputs
+**The Challenge**: When an operator has **two input streams**, they don't always arrive at the same speed.
+
+**Concrete Example**:
 
 ```
-Input 1 (fast): Events 1, 2, 3, BARRIER #5, 4, 5, 6
-Input 2 (slow): Events 1, 2, 3, 4, 5, 6, 7, BARRIER #5
+You have a JOIN operator merging:
+- Input 1: Account balance updates (FAST Kafka partition, low lag)
+- Input 2: Transfer instructions (SLOW Kafka partition, high lag)
+
+Checkpoint #5 starts:
+
+INPUT 1 (fast topic, processes quickly):
+  Alice=$1000
+  Bob=$500
+  Charlie=$800
+  ★ BARRIER #5 ★  ← arrives at t=1s (only took 1 second!)
+  Alice=$800      ← Post-barrier events start arriving
+  Bob=$700
+  Charlie=$750
+  
+INPUT 2 (slow topic, 10x slower):
+  Transfer: Alice → Bob ($200)
+  Transfer: Charlie → David ($50)
+  Transfer: Eve → Frank ($100)
+  Transfer: Alice → Bob ($200)  ← Same transfer again?
+  Transfer: Gina → Henry ($75)
+  Transfer: Ivan → Jane ($150)
+  Transfer: Kevin → Lisa ($300)
+  ★ BARRIER #5 ★  ← arrives at t=10s (took 10 seconds!)
 ```
 
-**What happens**:
-1. Operator sees barrier from Input 1 first
-2. **Blocks Input 1** (buffers events 4, 5, 6)
-3. Continues processing Input 2 (events 4, 5, 6, 7)
-4. Sees barrier from Input 2
-5. **Now snapshots state** (consistent state = processed all pre-barrier events)
-6. Unblocks Input 1, processes buffered events
+**See the problem?** 
+- Input 1's barrier arrives in **1 second**
+- Input 2's barrier arrives in **10 seconds**
+- Meanwhile, Input 1 keeps receiving events (Alice=$800, Bob=$700, etc.)
+
+**Question**: When do we take the snapshot?
+- If we snapshot when Input 1's barrier arrives → Input 1 is at "barrier time", but Input 2 is still 9 seconds behind!
+- If we keep processing Input 1 → Snapshot will include AFTER-barrier events from Input 1 but BEFORE-barrier events from Input 2 = **INCONSISTENT**!
+
+This is the barrier alignment problem in concrete terms!
 
 **WHY Block**:
 - Without blocking: State snapshot includes events after barrier = inconsistent
