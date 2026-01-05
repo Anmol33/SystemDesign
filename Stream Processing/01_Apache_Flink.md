@@ -1463,19 +1463,15 @@ Now you understand what JOIN does! Let's see how it works normally:
 
 #### Happy Flow: How JOIN Works Normally (No Checkpoints)
 
-**Question**: "JOIN has to wait for matching events, right? Doesn't matter how much Kafka lag there is?"
-
-**Answer**: **Exactly!** Let me show you the normal flow:
+During normal operation, the JOIN operator waits for matching events regardless of lag. This works perfectly fine:
 
 ```
-Normal operation (no barriers, no checkpoints):
-
 t=1s: Event C arrives (Debit Alice $200)
       JOIN state:
         - Pending debits: {Alice: $200}
         - Pending credits: {}
       
-      JOIN waits for matching credit... doesn't matter if Input 2 has lag!
+      JOIN waits for matching credit...
       
 t=5s: Event Z arrives (Credit Bob $200)
       JOIN sees:
@@ -1483,40 +1479,14 @@ t=5s: Event Z arrives (Credit Bob $200)
         - New credit: Bob $200
         - Amounts match! ✓
       
-      JOIN concludes: Transfer complete!
       Output: "Alice → Bob $200 verified ✓"
 ```
 
-**Key Point**: JOIN **waits for matching events** regardless of lag!
-- Event C arrives (debit) → JOIN stores it, waits
-- Event Z arrives 4 seconds later (credit) → JOIN matches them
-- **Lag doesn't matter** for normal operation!
+Even with extreme lag (e.g., one minute), the JOIN simply waits until the matching event arrives. **Lag doesn't matter for normal operation** - the JOIN will always wait for the debit and credit to match before outputting the result.
+
+The barrier alignment problem only appears during **checkpoints**, when Flink needs to decide when to snapshot the JOIN's state.
 
 ---
-
-**Another Example: Extreme Lag**
-
-```
-t=1s: Event C arrives (Debit Alice $200)
-      JOIN: "I'll wait for the matching credit..."
-      
-t=1min: Still waiting... (Input 2 has 1-minute lag!)
-        
-t=1min: Event Z finally arrives (Credit Bob $200)
-        JOIN: "There it is! Alice $200 debit + Bob $200 credit = Matched ✓"
-```
-
-**Normal operation handles lag perfectly!** JOIN just waits.
-
----
-
-**So What's the Problem Then?**
-
-Good question! **Normal operation works fine with lag.**
-
-**The problem is CHECKPOINTS!**
-
-Let's see why checkpoints make this tricky:
 
 ---
 
