@@ -1397,18 +1397,9 @@ This is the barrier alignment problem in concrete terms!
 
 ---
 
-#### Concrete Example: Bank Transfer ($200 Duplication Problem)
+#### Concrete Example: Bank Transfer Verification
 
-**STOP! Let me first clarify the core confusion:**
-
-This is NOT about:
-- ❌ "Operator 1 snapshots at 10:10, Operator 2 snapshots at 10:05"
-- ❌ Two different operators taking snapshots at different times
-
-This IS about:
-- ✅ **ONE operator** (the JOIN operator)
-- ✅ It has **TWO inputs**
-- ✅ When should this ONE operator take its snapshot?
+A common misconception is thinking barrier alignment is about different operators taking snapshots at different times. Actually, it's about **one operator** (the JOIN) with **two inputs** that need to snapshot consistently.
 
 ---
 
@@ -1525,149 +1516,100 @@ Good question! **Normal operation works fine with lag.**
 
 **The problem is CHECKPOINTS!**
 
-Barrier alignment problem is specifically about:
-- **WHEN to snapshot** the JOIN's state
-- Not about how JOIN matches events (that works fine!)
-
-Let's see why checkpoints make this tricky...
+Let's see why checkpoints make this tricky:
 
 ---
 
-#### Ultra-Simple Example: The Core Problem
+#### The Barrier Alignment Problem
 
-**Setup**: ONE operator with TWO inputs
+When a checkpoint starts, barriers are injected into both Kafka topics simultaneously. However, they arrive at the JOIN operator at different times due to partition lag.
 
-```
-Input 1 sends: Event A → Event B → BARRIER → Event C
-Input 2 sends: Event X → Event Y → Event Z → BARRIER
-```
-
-**Timeline**:
+**Timeline Example**:
 
 ```
-t=1s: Input 1's BARRIER arrives at JOIN operator
-      JOIN has processed:
-        - Input 1: A, B (ready to snapshot)
-        - Input 2: X, Y (still processing, barrier not here yet!)
-        
-      Question: Should JOIN snapshot NOW?
-      
-      If YES (snapshot at t=1s):
-        Snapshot contains: Input 1 up to B, Input 2 up to Y
-        
-      But then...
-      
-t=2s: JOIN continues processing
-      Processes Event C from Input 1 (AFTER the barrier!)
-      Processes Event Z from Input 2 (BEFORE its barrier)
-      
-t=3s: Input 2's BARRIER finally arrives
-      JOIN tries to snapshot Input 2 now?
-      But Input 1 already processed C (which was AFTER its barrier)!
-```
+t=0s: Checkpoint #5 starts, barriers injected
 
-**The Problem**:
-- Snapshot includes: Input 1 up to B (BEFORE barrier), Input 2 up to Z (processed AFTER snapshot started)
-- This is a **MIXED state**: Part before barrier (Input 1) + part after starting snapshot (Input 2)
-- If Flink restores from this snapshot, Event C will be replayed!
-
----
-
-#### Now with Money: Why This Causes Duplication
-
-**Setup**: JOIN operator merging two streams
-
-```
-Input 1 (Account Balances):
-  Event A: Alice=$1000
-  Event B: Alice=$1000 (status check)
-  BARRIER arrives at t=1s
-  Event C: Alice=$800  ← This shows $200 was deducted!
+INPUT 1 (Debit Stream - low lag):
+  Event A: Debit Alice $100
+  Event B: Debit Charlie $50  
+  Event C: Debit Alice $200
+  BARRIER #5 arrives at t=1s
+  Event D: Debit Eve $150  ← After barrier
   
-Input 2 (Transfer Commands):
-  Event X: Transfer $100 (Charlie → David)
-  Event Y: Transfer $50 (Eve → Frank)
-  Event Z: Transfer $200 (Alice → Bob)  ← THE ACTUAL TRANSFER
-  BARRIER arrives at t=3s
+INPUT 2 (Credit Stream - high lag):
+  Event X: Credit David $100
+  Event Y: Credit Frank $50
+  Event Z: Credit Bob $200
+  ... (more events)
+  BARRIER #5 arrives at t=10s  ← 9 seconds later!
 ```
 
-**WITHOUT Blocking**:
-
-```
-t=1s: BARRIER from Input 1 arrives
-      JOIN snapshots immediately:
-        - Input 1 state: Last processed = B (Alice=$1000)
-        - Input 2 state: Last processed = Y (hasn't seen Z yet)
-      
-      JOIN continues processing...
-      
-t=2s: JOIN processes Event C from Input 1
-      Alice=$800 (the $200 has been deducted!)
-      
-      BUT our snapshot says Alice=$1000!
-      AND our snapshot hasn't seen Event Z (the $200 transfer) yet!
-      
-t=3s: BARRIER from Input 2 arrives
-      Input 2 state now includes: X, Y, Z (the $200 transfer)
-```
-
-**On Crash and Restore**:
-1. Restore snapshot: Alice=$1000 (from Input 1 at time of snapshot)
-2. Replay Input 2 from snapshot point: Includes Event Z (Transfer $200)
-3. JOIN processes Event Z: Alice loses $200 → Alice=$800
-4. **BUT** Event C already showed Alice=$800 (the transfer already happened!)
-5. **Result**: Transfer happened TWICE! Alice goes to $600, Bob goes to $900
-
-**The money duplicated because**:
-- Snapshot captured Input 1 at "before transfer" state (Alice=$1000)
-- But Input 1 already processed Event C which showed "after transfer" (Alice=$800)
-- Snapshot captured Input 2 which includes Event Z (the transfer)
-- On restore: Transfer Z executes again!
+**The Dilemma**: When should the JOIN operator take its snapshot?
 
 ---
 
-#### WITH Blocking - Correct!
+#### Option 1: Snapshot When First Barrier Arrives (WRONG)
 
 ```
-t=1s: BARRIER from Input 1 arrives
-      → BLOCK Input 1 (don't process Event C yet!)
-      → Buffer Event C in memory
-      → Continue processing Input 2
+t=1s: Input 1 BARRIER arrives
+      Snapshot immediately:
+        - Pending debits: {Alice: $200, Charlie: $50}
+        - Pending credits: {David: $100, Frank: $50}
       
-t=2s: Process Event Z from Input 2 (the $200 transfer)
+      Continue processing...
       
-t=3s: BARRIER from Input 2 arrives
-      → NOW both inputs at barrier point
-      → Take snapshot:
-          Input 1: Last processed = B (Alice=$1000)
-          Input 2: Last processed = Z (includes transfer)
-      → UNBLOCK Input 1
-      → Process buffered Event C (Alice=$800)
+t=2s: Process Event Z (Credit Bob $200)
+      Match with debit Alice $200 ✓
+      
+t=3s: Process Event D (Debit Eve $150)
+      
+t=10s: Input 2 BARRIER arrives
 ```
 
-**On Crash and Restore**:
-1. Restore snapshot: Alice=$1000
-2. Replay Input 2: Includes Event Z (Transfer $200)
-3. Process Event Z ONCE: Alice=$800
-4. Event C will be replayed showing Alice=$800 (correct!)
-5. **Result**: Transfer happened ONCE! Alice=$800, Bob=$700 ✓
+**What's wrong?**
+- Snapshot captured: Pending debits include Alice $200
+- But then Event Z (Credit Bob $200) was processed and matched with Alice's debit
+- On restore: Alice's $200 debit is still pending (from snapshot), so Event Z will match it AGAIN
+- **Result**: Transfer matched twice! Money duplicated!
+
+---
+
+#### Option 2: Block Fast Input Until Both Barriers Arrive (CORRECT)
+
+```
+t=1s: Input 1 BARRIER arrives
+      BLOCK Input 1 (buffer Event D, don't process yet!)
+      Continue processing Input 2
+      
+t=2s: Process Event Z (Credit Bob $200)
+      Match with debit Alice $200 ✓
+      
+t=10s: Input 2 BARRIER arrives
+       NOW take snapshot:
+         - Matched: {Alice → Bob $200}
+         - Pending debits: {Charlie: $50}
+         - Pending credits: {David: $100, Frank: $50}
+       
+       UNBLOCK Input 1, process buffered Event D
+```
+
+**Why this works**:
+- Snapshot captured AFTER both streams reached barrier point
+- Alice → Bob transfer already matched before snapshot
+- On restore: Transfer won't be matched again ✓
 
 ---
 
 #### Key Insight
 
-**The problem is**:
-- ONE operator (JOIN)
-- TWO inputs arriving at different times
-- If we snapshot when first input's barrier arrives, the second input isn't ready
-- Snapshot captures MIXED state: "before barrier" from Input 1 + "after snapshot started" from Input 2
-- On restore: Events get replayed incorrectly
+Barrier alignment ensures snapshot consistency when one operator has multiple inputs arriving at different speeds. The solution is to **block the fast input** until the slow input's barrier arrives, guaranteeing all inputs snapshot at the same logical point in time.
 
-**The solution**:
-- BLOCK the fast input
-- Wait for slow input's barrier
-- Snapshot when BOTH at barrier point
-- Guarantees consistent state
+**Production Impact**:
+- **Kafka lag**: If one input is 10 minutes behind, the fast input blocks for 10 minutes
+- **Memory**: Buffered events consume RAM (can cause OOM if lag too large)
+- **Latency**: Entire job slowed by slowest input
+
+**Production fix**: Monitor Kafka partition lag, keep inputs balanced!
 
 ---
 
