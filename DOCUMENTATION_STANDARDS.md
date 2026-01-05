@@ -95,6 +95,220 @@ batch_shuffle_spill_bytes_total:
 
 ---
 
+## Explain Like Teaching (ELT) Principle
+
+**Core Philosophy**: Write documentation as if you're **teaching a smart beginner**, not creating a reference manual for experts.
+
+### Mandatory Requirements
+
+Every section must follow this teaching pattern:
+
+#### 1. **Scenario First, Abstraction Second**
+
+❌ **Wrong** (starting with abstraction):
+```markdown
+### Event Time vs Processing Time
+
+Flink supports two time semantics: event time and processing time.
+Event time is the time embedded in the event itself...
+```
+
+✅ **Correct** (starting with scenario):
+```markdown
+### The Problem: When Phones Go Offline
+
+**Scenario**: You're building analytics for a mobile shopping app.
+
+10:00 AM: User scrolls on phone, views iPhone case
+10:01 AM: User enters subway tunnel (phone offline)
+          Views AirPods, Charger, Cable
+          ALL 3 EVENTS STUCK IN PHONE
+10:06 AM: User exits tunnel (phone reconnects)
+          Phone uploads ALL 4 events at once
+
+**Question**: Do these 4 events belong in 10:00-10:05 window or 10:05-10:10 window?
+
+This is why Flink uses Event Time instead of Processing Time...
+```
+
+**Why**: Scenarios create **immediate need** for the technical solution. Readers understand "why this matters" before learning "how it works".
+
+---
+
+#### 2. **WHY Before WHAT**
+
+Always explain **why a component exists** before explaining **what it does**.
+
+❌ **Wrong** (what without why):
+```markdown
+### JobMaster
+
+The JobMaster coordinates task execution. It schedules tasks to TaskManagers
+and manages checkpoints.
+```
+
+✅ **Correct** (why before what):
+```markdown
+### JobMaster: Dedicated Job Coordinator
+
+**Why it exists**: 
+Each job needs isolated coordination - Job A's checkpoint shouldn't 
+interfere with Job B's scheduling. A single global coordinator would 
+become a bottleneck.
+
+**What it does**:
+- Schedules tasks to TaskManagers (for THIS job only)
+- Manages checkpoints (isolated from other jobs)
+- Handles failover (without affecting other running jobs)
+
+**Analogy**: Like a project manager assigned to one project, not managing 
+the entire company.
+```
+
+**Why**: Explaining rationale makes architecture memorable. "Isolation" is more meaningful than "coordinates tasks".
+
+---
+
+#### 3. **Progressive Disclosure**
+
+Start simple, add complexity incrementally.
+
+❌ **Wrong** (all complexity upfront):
+```markdown
+### State Management
+
+Flink provides Keyed State and Operator State. Keyed State uses RocksDB
+as an embedded state backend with LSM-tree structure for efficient writes.
+It supports incremental checkpointing via SST file snapshots...
+```
+
+✅ **Correct** (layered explanation):
+```markdown
+### State Management: Counting User Clicks
+
+**Layer 1: The Need**
+You need to count clicks per user. Where do you store the count?
+
+**Layer 2: The Solution**
+Flink gives each user a dedicated counter (Keyed State).
+All events for user "alice" go to same TaskManager.
+
+**Layer 3: The Scalability Challenge**
+What if state = 100GB? Storing in JVM heap causes long GC pauses.
+
+**Layer 4: The Engineering Solution**
+Flink uses RocksDB (off-heap storage on SSD).
+- 100GB state lives outside JVM
+- GC only scans 4GB heap (fast pauses <100ms)
+- State persists across crashes
+```
+
+**Why**: Each layer builds on the previous. Readers grasp "why RocksDB" only after understanding "why not heap".
+
+---
+
+#### 4. **Use Analogies for Abstract Concepts**
+
+Anchor technical concepts to familiar real-world systems.
+
+**Examples**:
+- **Dispatcher** = Airport check-in counter (routes you to the right gate)
+- **Watermarks** = "Last call for boarding" announcement (no more passengers after this)
+- **Keyed State** = Hotel room keys (each guest has their own room, isolated storage)
+- **Backpressure** = Traffic jam (upstream slows down when downstream is congested)
+
+**Template**:
+```markdown
+**Analogy**: [Component] is like [familiar system]. Just as [familiar system] 
+does [action], [component] does [technical action].
+```
+
+---
+
+#### 5. **Full Picture Before Details**
+
+Provide a complete workflow overview before diving into components.
+
+❌ **Wrong** (components in isolation):
+```markdown
+## Core Architecture
+
+### 1. Dispatcher
+Handles job submissions...
+
+### 2. JobMaster  
+Coordinates execution...
+
+### 3. ResourceManager
+Manages slots...
+```
+
+✅ **Correct** (workflow then components):
+```markdown
+## Core Architecture: Following a Job's Journey
+
+**Complete Flow**:
+1. You submit WordCount.jar
+2. **Dispatcher** accepts it, assigns Job ID
+3. **ResourceManager** finds available TaskManager slots
+4. **JobMaster** (created for this job) schedules tasks
+5. **TaskManagers** execute map/reduce operations
+6. Results written to output
+
+Now let's see WHY each component exists...
+
+### Dispatcher: The Entry Point
+[explanation with why]
+
+### JobMaster: Per-Job Coordinator  
+[explanation with why]
+```
+
+**Why**: Readers build mental model of end-to-end flow before learning individual pieces.
+
+---
+
+### Anti-Patterns to Avoid
+
+❌ **Reference-style bullet points**:
+```markdown
+- Event Time: Time when event occurred
+- Processing Time: Time when event processed
+- Watermark: Progress indicator for event time
+```
+This belongs in a glossary, not teaching documentation.
+
+❌ **Code dumps without narrative**:
+```java
+// 40 lines of code
+WatermarkStrategy<Event> strategy = WatermarkStrategy
+    .forBoundedOutOfOrderness(Duration.ofSeconds(10))
+    .withTimestampAssigner((event, ts) -> event.getTimestamp());
+```
+Show configuration, explain what each parameter *means in the scenario*.
+
+❌ **Technical jargon without grounding**:
+```markdown
+Flink uses Chandy-Lamport algorithm for asynchronous distributed snapshots
+with barrier alignment across parallel streams...
+```
+Start with "What problem does this solve?" using a concrete example.
+
+---
+
+### Enforcement
+
+**When reviewing documentation**:
+1. Does the introduction use a concrete scenario?
+2. Does each component explanation start with "why"?
+3. Are abstract concepts paired with analogies?
+4. Is there a full-picture workflow before component details?
+5. Is code <10% of content?
+
+If any answer is "No", the documentation must be rewritten.
+
+---
+
 ## Document Type Classification
 
 Before writing a document, identify which category it belongs to. This determines your approach to code examples, technical depth, and explanation style.
