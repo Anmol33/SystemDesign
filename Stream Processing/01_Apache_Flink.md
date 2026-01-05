@@ -305,76 +305,147 @@ Flink's **Chandy-Lamport distributed snapshots** enable exactly-once processing 
 
 ---
 
-## 2. Core Architecture
+## 2. Core Architecture: Following a Job's Journey
 
-Flink follows a **master-worker** architecture with a unique "Trinity" structure for job management.
+**Scenario**: You've written a fraud detection job. Let's follow it from submission to execution to understand how Flink's architecture works.
 
-```mermaid
-graph TD
-    subgraph JobManager["JobManager (Master)"]
-        Disp["Dispatcher"] --> JM["JobMaster (Per Job)"]
-        JM --> RM["ResourceManager"]
-    end
+### The Journey Begins: Submitting Your Job
 
-    subgraph TaskManager1["TaskManager 1"]
-        Netty1["Netty Network Stack"]
-        Slot1["Task Slot 1"]
-        Slot2["Task Slot 2"]
-    end
-    
-    subgraph TaskManager2["TaskManager 2"]
-        Netty2["Netty Network Stack"]
-        Slot3["Task Slot 3"]
-        Slot4["Task Slot 4"]
-    end
-
-    JM <-->|"Checkpoint Barriers"| Slot1
-    JM <-->|"Checkpoint Barriers"| Slot3
-    Slot1 <-->|"Credit-Based Transfer"| Netty1
-    Slot3 <-->|"Credit-Based Transfer"| Netty2
-    Netty1 <-->|Network| Netty2
+You run:
+```bash
+flink run fraud-detection.jar
 ```
 
-### Key Components
-
-**1. JobManager Trinity (Control Plane)**:
-
-**Dispatcher**:
-- REST API entry point (`http://jobmanager:8081`)
-- Accepts job submissions
-- Spins up dedicated JobMaster per job
-- Manages job lifecycle (start, cancel, stop)
-
-**JobMaster** (Per-job brain):
-- **Checkpoint Coordinator**: Triggers distributed snapshots every N seconds
-- Execution graph management
-- Failure recovery coordination
-- **Debug Note**: Checkpoint failures? Check JobMaster logs, not Dispatcher
-
-**ResourceManager**:
-- Infrastructure liaison (talks to Kubernetes, YARN, Mesos)
-- Requests/releases TaskManager containers
-- Doesn't understand jobs, only resources (CPU, RAM)
-
-**2. TaskManager (Data Plane)**:
-
-**Task Slots**:
-- Fixed resource allocation (e.g., 4GB RAM, 2 CPU cores)
-- Unlike Spark executors (shared heap), Flink slots have clear boundaries
-- Multiple tasks can run in one slot via **operator chaining**
-
-**Network Stack (Netty)**:
-- **Credit-based flow control**: Downstream grants "credits" (buffer space) to upstream
-- Prevents buffer overflow and OOM
-- 32KB buffer size (default)
-
-**3. State Backend (RocksDB)**:
-- Embedded LSM-tree database
-- **Off-heap**: Lives outside JVM to avoid GC pauses
-- **Disk-backed**: Can hold TB-scale state on SSD
-- **Incremental checkpoints**: Only snapshot changed data
+**What happens next?** Your JAR file needs to be deployed, coordinated, and executed across a cluster of machines. Here's how Flink orchestrates this:
 
 ---
+
+### Step 1: The Dispatcher (Airport Check-In Desk)
+
+**Your JAR arrives at the Dispatcher**
+
+**What is it?**: The Dispatcher is Flink's **central entry point** - think of it like an airport check-in desk.
+
+**Why does it exist?**:
+- Handles multiple jobs arriving at different times
+- Routes each job to the right place
+- Provides REST API for job submission (`http://jobmanager:8081`)
+
+**What it does**:
+1. Receives your `fraud-detection.jar`
+2. Validates it (does it have a `main()` method?)
+3. Assigns a Job ID: `job-abc123`
+4. Creates a dedicated **JobMaster** just for your job
+
+**Analogy**: Like checking in at airport - you get a boarding pass (Job ID) and are routed to your specific gate (JobMaster).
+
+---
+
+### Step 2: The JobMaster (Your Personal Project Manager)
+
+**Now you have a dedicated coordinator for your fraud detection job**
+
+**What is it?**: JobMaster is a **per-job brain** - each job gets its own.
+
+**Why separate JobMaster per job?**:
+- **Isolation**: Your job's failures don't affect other jobs
+- **Dedicated resources**: Full focus on your job's success
+- **Independent lifecycle**: Can cancel your job without touching others
+
+**What it does**:
+1. **Builds execution graph**: Converts your code into DAG of operators
+   - Example: `read_kafka → detect_fraud → write_alerts`
+2. **Checkpoint Coordinator**: Triggers snapshots every 60 seconds
+3. **Failure recovery**: If a task crashes, JobMaster restarts it
+4. **Tracks progress**: Monitors which operators are running, which finished
+
+**Analogy**: Like a project manager assigned specifically to YOUR project - knows every detail, coordinates all pieces.
+
+**Debug Tip**: Checkpoint failures? Check JobMaster logs, not Dispatcher logs.
+
+---
+
+### Step 3: The ResourceManager (Infrastructure Liaison)
+
+**JobMaster needs machines to run your job. Enter ResourceManager.**
+
+**What is it?**: The **infrastructure middleman** - talks to Kubernetes/YARN/Mesos on your behalf.
+
+**Why separate from JobMaster?**:
+- **Abstraction**: Your job doesn't care if it's on K8s, YARN, or bare metal
+- **Centralized resource allocation**: One component handles all infrastructure
+- **Job-agnostic**: Understands CPU/RAM, not fraud detection logic
+
+**What it does**:
+1. JobMaster requests: "I need 4 TaskManagers, 8GB RAM each"
+2. ResourceManager translates to infrastructure:
+   - Kubernetes: `kubectl create pod flink-taskmanager-1`
+   - YARN: Request 4 containers from YARN ResourceManager
+3. Waits for machines to come online
+4. Reports back to JobMaster: "Your TaskManagers are ready"
+
+**Analogy**: Like a procurement team - you say "I need 4 servers", they figure out how to get them from the cloud provider.
+
+---
+
+### Step 4: TaskManagers (The Workers)
+
+**Your job code finally runs here**
+
+**What are they?**: The **actual worker machines** where your fraud detection logic executes.
+
+**Task Slots** (subdivisions of TaskManager):
+- Each TaskManager divided into **slots** (e.g., 4 slots per machine)
+- **Fixed resources per slot**: 2GB RAM, 1 CPU core
+- **Why fixed?**: Unlike Spark (shared heap), Flink gives clear boundaries
+- **Prevents interference**: Slot 1's memory explosion doesn't crash Slot 2
+
+**Network Stack (Netty)**:
+- **Credit-based flow control**: Like traffic lights for data
+- Downstream operator says: "I have 10 free buffers" (credits)
+- Upstream only sends data if credits available
+- **Prevents OOM**: Can't overwhelm downstream with too much data
+- **Buffer size**: 32KB per buffer (default)
+
+**State Backend (RocksDB)**:
+- **What is it?**: Local database embedded in each TaskManager
+- **Why exists?**: Your fraud detection needs to remember "last transaction per user"
+- **Off-heap storage**: Lives outside JVM to avoid garbage collection pauses
+- **Disk-backed**: Can hold TB-scale state on SSD
+- **Incremental checkpoints**: Only saves changed data (not entire state)
+
+---
+
+### Putting It All Together: The Full Flow
+
+```
+You: `flink run fraud-detection.jar`
+  ↓
+Dispatcher: "New job! Creating JobMaster for job-abc123"
+  ↓
+JobMaster: "I need resources. Requesting 4 TaskManagers"
+  ↓
+ResourceManager: "Creating 4 pods in Kubernetes"
+  ↓
+TaskManagers: "Ready! Waiting for work"
+  ↓
+JobMaster: "Deploy operators: read_kafka → detect_fraud → write_alerts"
+  ↓
+TaskManagers: "Running your code, processing transactions in real-time"
+  ↓
+(Every 60s) JobMaster: "Checkpoint time! Snapshot all state"
+  ↓
+If TaskManager crashes:
+  JobMaster: "Restart failed tasks, restore from last checkpoint"
+```
+
+**Key Takeaway**: Flink's architecture separates concerns:
+- **Dispatcher**: Routes jobs
+- **JobMaster**: Coordinates YOUR specific job
+- **ResourceManager**: Handles infrastructure
+- **TaskManagers**: Execute your code
+
+This separation enables isolation (jobs don't interfere), flexibility (works on K8s/YARN), and resilience (job-level failure recovery).
 
 ## 3. How It Works: Time, State, and Watermarks
 
