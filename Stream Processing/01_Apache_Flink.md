@@ -84,146 +84,32 @@ The history of stream processing is defined by one challenge: **Correctness unde
 
 ### Generation 1: Apache Storm (2011) - Speed Without Guarantees
 
-**Nathan Marz at Twitter** created the first widely-adopted stream processor.
-
-**Architecture**:
-- **Spouts**: Data sources
-- **Bolts**: Processing operators
-- **Topology**: DAG of spouts and bolts
-
-**Key Limitation**: **At-least-once** processing only
-- On failure, replay records from source
-- No state checkpointing
-- Result: Duplicate processing, incorrect aggregations
-
-**The Lambda Architecture Hack** (2011-2014):
-Because Storm couldn't guarantee correctness, teams ran **two pipelines**:
-
-```mermaid
-graph LR
-    Source[Data Source] -->|Real-time| Storm["Speed Layer: Storm"]
-    Source -->|Batch| Hadoop["Batch Layer: Hadoop"]
-    
-    Storm -->|99% accurate<br/>100ms latency| Serving[Serving DB]
-    Hadoop -->|100% accurate<br/>24h latency| Serving
-    
-    Serving --> User[User Query]
-    
-    style Storm fill:#ff9999
-    style Hadoop fill:#99ff99
-```
-
-**The Problem**: Violates DRY (Don't Repeat Yourself)
-1. **Logic Divergence**: Write `calculate_revenue()` twice (Java for Storm, SQL for Hive)
-2. **Operational Nightmare**: Maintain two clusters, two failure modes
-3. **Eventually Consistent**: Speed layer gradually corrected by batch layer
-
-**Why It Failed**:
-- Teams spent 60% of time reconciling differences between layers
-- Bugs in one layer often missed in the other
-- Complexity killed agility
-
----
+**At-most-once guarantee** - Fast but data loss possible. Led to Lambda Architecture (dual batch+stream pipelines).
 
 ### Generation 2: Spark Streaming (2013) - Micro-Batch Compromise
 
-**Berkeley AMPLab** added streaming to Spark via **micro-batching**.
-
-**Mechanism**: Chop stream into tiny batches (e.g., 500ms), run batch job on each
-
-**Advantages**:
-- **Exactly-once**: Each micro-batch is transactional
-- **Unified API**: Same code for batch and streaming
-- **Leverage Spark**: Reuse batch infrastructure
-
-**Fatal Flaw: Latency Floor**
-```
-Latency >= Micro-batch interval + Scheduler overhead
-Typical: 500ms + 500ms = 1 second minimum
-```
-
-**Why It's Not True Streaming**:
-- Must wait for entire micro-batch to complete before processing
-- Scheduler overhead dominates at small batch sizes
-- Backpressure is reactive (slow down source after memory fills)
-
-**Use Cases Where It's Acceptable**:
-- Simple ETL (5-second latency OK)
-- Aggregations over windows (e.g., "count clicks per 5 minutes")
-- Analytics dashboards
-
-**Use Cases Where It Fails**:
-- Fraud detection (need <100ms)
-- Alerting (need real-time)
-- CEP (complex event patterns require stateful processing)
-
----
+**Exactly-once via micro-batching** - Reliable but high latency (500ms+ minimum). Not acceptable for real-time.
 
 ### Generation 3: Apache Flink (2014) - True Streaming Solution
 
-**TU Berlin's Stratosphere Project** (2010-2014) became Apache Flink.
+**Exactly-once + low latency** - Combines best of both using Chandy-Lamport. The breakthrough.
 
-**Core Innovations**:
+```mermaid
+timeline
+    title Stream Processing Evolution
+    2011 : Storm : At-most-once : Fast, unreliable
+    2013 : Spark : Exactly-once : High latency
+    2014 : Flink : Exactly-once : Low latency ✓
+```
 
-**1. True Streaming** (not micro-batch)
+| Feature | Storm (2011) | Spark (2013) | Flink (2014) |
+|---------|-------------|--------------|--------------|
+| **Guarantee** | At-most-once | Exactly-once | Exactly-once |
+| **Latency** | <100ms | 500ms-5s | <100ms |
+| **Mechanism** | Direct streaming | Micro-batch | Chandy-Lamport |
+| **Problem** | Data loss | High latency | ✓ None |
 
-Unlike Spark's micro-batch approach (which processes data in 500ms chunks), Flink uses **long-running operators** that continuously pass messages between each other. This means:
-- **No artificial batching**: Events processed individually as they arrive
-- **Ultra-low latency**: 1-100ms end-to-end (only network overhead)
-- **No scheduler delay**: Operators stay running; no JVM startup for each batch
-- **Continuous computation**: Like a pipeline where data flows continuously, not in chunks
-
-**Why it matters**: Fraud detection needs decisions in <100ms, impossible with 500ms+ micro-batches.
-
----
-
-**2. Exactly-Once via Chandy-Lamport Snapshots**
-
-Flink achieves **exactly-once processing** without pausing the data stream. The mechanism:
-- **Distributed snapshots**: Takes a consistent snapshot of entire job state while processing continues
-- **Checkpoint barriers**: Special markers flow with data to coordinate snapshots across operators
-- **Durable storage**: State saved to S3/HDFS (survives machine failures)
-- **Failure recovery**: On crash, restore state from last successful checkpoint and replay from that point
-
-**Why it matters**: Guarantees no data loss and no duplicates, even when machines fail mid-processing. Critical for financial transactions where "exactly once" is legally required.
-
----
-
-**3. Advanced State Management**
-
-Flink can maintain **massive amounts of state** (terabytes) efficiently:
-- **Embedded RocksDB**: Each operator has local LSM-tree database stored on SSD (not RAM)
-- **Off-heap storage**: State lives outside JVM to avoid garbage collection pauses
-- **TB-scale per operator**: Single operator can manage terabytes of state (user sessions, aggregations)
-- **Queryable state**: External systems can query running job's state via REST API (e.g., "What's the current count for user123?")
-- **Incremental checkpoints**: Only save changed data, not entire state (100GB state → 5GB checkpoint)
-
-**Why it matters**: Enables stateful computations like "count all events per user in last 30 days" without external databases. State co-located with computation = fast lookups.
-
----
-
-**4. Event-Time Processing**
-
-Flink processes events based on **when they happened** (event time), not when they arrived (processing time). This handles:
-- **Out-of-order events**: Mobile app generates event at 10:00 AM, arrives at 10:05 AM due to network delay
-- **Watermarks**: Flink tracks "event time progress" using watermarks (guarantees like "no events before 10:00 AM will arrive")
-- **Late event buffering**: Holds events temporarily to wait for stragglers
-- **Correct window results**: 5-minute window from 10:00-10:05 includes all events with timestamps in that range, regardless of arrival time
-
-**Why it matters**: Getting accurate "clicks in last hour" when events arrive out of order. Without event-time, results would be wrong.
-
----
-
-**5. Credit-Based Backpressure**
-
-Flink prevents memory overflows using a **flow control** system:
-- **Credit system**: Downstream operators advertise "I have 10 free buffers" to upstream
-- **Sender respects credits**: Upstream only sends data if downstream has space
-- **Natural throttling**: When downstream is slow, upstream automatically slows down (no manual tuning)
-- **Prevents OOM**: Can't overwhelm operators with more data than they can handle
-- **Propagates to source**: Backpressure flows all the way to Kafka source (stops reading when system full)
-
-**Why it matters**: **Reactive** backpressure (Spark) waits for OOM, then crashes. **Proactive** backpressure (Flink) prevents crashes before they happen.
+**Why Flink Won**: True streaming (not micro-batch) + exactly-once (Chandy-Lamport snapshots) + low latency (<100ms).
 
 ---
 
