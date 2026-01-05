@@ -505,6 +505,65 @@ graph TB
 - **Dashed arrows**: Data flow (events between operators)
 - **RocksDB**: Off-heap state storage (survives crashes)
 
+---
+
+### Task Slots vs DAG: Important Clarification
+
+**Common Misconception**: "Does one task slot contain the entire DAG (Source → Map → Aggregate → Sink)?"
+
+**Answer**: **NO!** Each task slot runs **ONE operator instance** (one stage of the DAG).
+
+**How the DAG is Distributed**:
+
+```
+Your Job DAG:
+Source → Map → Aggregate → Sink
+
+With Parallelism = 4:
+
+TaskManager 1:
+  - Task Slot 1: Source instance 0
+  - Task Slot 2: Map instance 0  
+  - Task Slot 3: Aggregate instance 0
+  - Task Slot 4: Sink instance 0
+
+TaskManager 2:
+  - Task Slot 1: Source instance 1
+  - Task Slot 2: Map instance 1
+  - Task Slot 3: Aggregate instance 1
+  - Task Slot 4: Sink instance 1
+
+... (and so on for instances 2 and 3)
+```
+
+**Key Points**:
+1. **One slot = One operator instance** (e.g., "Map instance 0")
+2. **Events flow between slots** via network buffers (dashed arrows in diagram)
+3. **Pipeline spans multiple slots** across TaskManagers
+
+**Example Flow for ONE Event**:
+```
+Event arrives →
+  Slot 1 (Source-0) reads from Kafka →
+    Network buffer sends to Slot 2 →
+      Slot 2 (Map-0) transforms event →
+        Network buffer sends to Slot 3 →
+          Slot 3 (Aggregate-0) updates state →
+            Network buffer sends to Slot 4 →
+              Slot 4 (Sink-0) writes to Kafka
+```
+
+**Why Not Put Entire DAG in One Slot?**
+- **Parallelism**: Need 4 separate Source instances reading 4 Kafka partitions simultaneously
+- **Resource Isolation**: Map might need 2GB RAM, Sink needs 4GB - separate slots allow different allocations
+- **Fault Tolerance**: If one operator fails, only restart that stage
+
+**Special Case: Operator Chaining**
+- Sometimes Flink **does** chain operators in same slot (e.g., Source+Map together)
+- Only when: same parallelism, no shuffle, connected directly
+- Optimization to avoid network overhead
+- But logically they're still separate operators
+
 ## 3. How It Works: Solving Real Problems with Event-Time and State
 
 **Scenario**: You're building analytics for a mobile shopping app. You want to count "product views per user in 5-minute windows" to detect trending products.
@@ -616,6 +675,141 @@ Watermark(10:05) flows through → "No events before 10:05 will arrive"
 2. Calculates: "Latest timestamp = 10:05, tolerance = 2 minutes"
 3. Emits: Watermark(10:03) = "No events before 10:03 will arrive"
 4. When Watermark reaches window end (10:05), trigger computation
+
+---
+
+### WHO Generates Watermarks and WHEN?
+
+**Critical Question**: Who is actually creating these watermark markers?
+
+**Answer**: The **Source Operator** generates watermarks based on YOUR configuration.
+
+---
+
+#### Step-by-Step: Watermark Generation
+
+**1. You Configure a Watermark Strategy** (in your code):
+
+```java
+DataStream<Event> stream = env
+    .addSource(new KafkaSource<>())
+    .assignTimestampsAndWatermarks(
+        WatermarkStrategy
+            .<Event>forBoundedOutOfOrderness(Duration.ofMinutes(2))
+            .withTimestampAssigner((event, timestamp) -> event.getTimestamp())
+    );
+```
+
+**What this means**:
+- `forBoundedOutOfOrderness(2 minutes)`: Tolerate events up to 2 minutes late
+- `withTimestampAssigner`: Extract timestamp from event (e.g., `event.timestamp` field)
+
+---
+
+**2. Source Operator Generates Watermarks** (automatically, periodically):
+
+```
+Source Operator (reading from Kafka partition 0):
+
+t=10:00:00 - Event arrives {time: 10:00:00}
+             Extract timestamp: 10:00:00
+             Track: maxTimestamp = 10:00:00
+             
+t=10:00:05 - Event arrives {time: 10:00:05}
+             Extract timestamp: 10:00:05
+             Track: maxTimestamp = 10:00:05
+             
+t=10:00:10 - Event arrives {time: 10:00:08}
+             Extract timestamp: 10:00:08
+             Track: maxTimestamp = 10:00:08 (not updated, older than 10:00:05)
+             
+t=10:00:12 - PERIODIC WATERMARK CHECK (every 200ms by default)
+             Calculate: maxTimestamp - allowedLateness
+                      = 10:00:05 - 2 minutes
+                      = 09:58:05
+             EMIT: Watermark(09:58:05)
+             
+t=10:00:15 - Event arrives {time: 10:00:15}
+             Track: maxTimestamp = 10:00:15
+             
+t=10:00:20 - PERIODIC WATERMARK CHECK
+             Calculate: 10:00:15 - 2min = 09:58:15
+             EMIT: Watermark(09:58:15)
+```
+
+---
+
+**3. Watermark Flows Downstream** (like a special event):
+
+```
+Source (generates) → Map (forwards) → Aggregate (uses to trigger windows) → Sink
+     ↓                    ↓                        ↓
+  Watermark(t)      Watermark(t)              Watermark(t)
+```
+
+**Each operator**:
+- Receives watermark from upstream
+- Processes it (e.g., window operator checks if windows should close)
+- Forwards watermark to downstream
+
+---
+
+#### Configuration Options
+
+**Periodic Watermarks** (default):
+```java
+env.getConfig().setAutoWatermarkInterval(200); // Generate every 200ms
+```
+
+**How it works**:
+- Every 200ms, source operator checks: "What's the max timestamp I've seen?"
+- Calculates: `watermark = maxTimestamp - allowedLateness`
+- Emits watermark
+
+**Per-Event Watermarks** (custom, for special cases):
+```java
+WatermarkStrategy.forGenerator((ctx) -> new WatermarkGenerator<Event>() {
+    public void onEvent(Event event, long eventTimestamp, WatermarkOutput output) {
+        // Emit watermark on EVERY event (usually too expensive)
+        output.emitWatermark(new Watermark(eventTimestamp - 2000));
+    }
+});
+```
+
+---
+
+#### Multiple Sources and Watermarks
+
+**Problem**: If you have 4 Kafka partitions, you have 4 source operators. Which watermark does Flink use?
+
+**Answer**: Flink uses the **MINIMUM** watermark across all parallel sources.
+
+```
+Source instance 0 (partition 0): Watermark(10:00:05)
+Source instance 1 (partition 1): Watermark(10:00:03)  ← SLOWEST
+Source instance 2 (partition 2): Watermark(10:00:07)
+Source instance 3 (partition 3): Watermark(10:00:06)
+
+Downstream sees: Watermark(10:00:03)
+```
+
+**Why?**: To guarantee correctness. If we used max (10:00:07), partition 1 might still have events from 10:00:04 that haven't arrived yet.
+
+**Implication**: One slow partition slows down ALL windows!
+
+---
+
+#### Summary: WHO and WHEN
+
+| Question | Answer |
+|----------|--------|
+| **WHO generates?** | Source operator (first operator in DAG) |
+| **WHEN generated?** | Periodically (every 200ms by default) |
+| **HOW calculated?** | `maxTimestamp - allowedLateness` |
+| **Multiple sources?** | Flink uses MIN across all parallel sources |
+| **Who uses watermarks?** | Window operators (to trigger window computation) |
+
+**Key Insight**: Watermarks are generated at the SOURCE (where events enter Flink), then flow through the pipeline like special events.
 
 ---
 
