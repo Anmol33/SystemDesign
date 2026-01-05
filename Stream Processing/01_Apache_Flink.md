@@ -1651,26 +1651,14 @@ BOTH at barrier → Snapshot (Alice=$1000, T2 queued) → Unblock → Process A3
 
 ---
 
-### Checkpoint Flow Diagram
+### Checkpoint Summary: The Complete Picture
+
+**What Gets Saved**: Operator state + Source offsets  
+**When Offsets Commit**: Only after checkpoint succeeds  
+**Why**: Guarantee exactly-once processing
 
 ```mermaid
 sequenceDiagram
-    participant Chk as Checkpoint Coordinator
-    participant Src as Source
-    participant Op as Operator
-    participant Sink as Sink
-    
-    Chk->>Src: "1. Inject Barrier (ID=5)"
-    Note right of Src: "Snapshot Offset<br/>(Kafka offset 1000)"
-    Src->>Op: "Forward Barrier"
-    
-    Note right of Op: "2. Wait for barrier on ALL inputs<br/>Snapshot State<br/>(Alice: $4000, Bob: $2000)"
-    Op->>Sink: "Forward Barrier"
-    
-    Note right of Sink: "3. Snapshot State<br/>Pre-commit transaction"
-    Sink-->>Chk: "ACK Barrier 5"
-    
-    Note over Chk: "Global Checkpoint Complete"
 ```
 
 ---
