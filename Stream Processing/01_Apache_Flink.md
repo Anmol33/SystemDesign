@@ -1259,6 +1259,64 @@ This is CONSISTENT:
 
 **The Challenge**: When an operator has **two input streams**, they don't always arrive at the same speed.
 
+---
+
+#### CRITICAL: Why Do Barriers Arrive at Different Times?
+
+**Your Question**: "If barriers are injected at the SAME TIME, why does one arrive faster than the other?"
+
+**Answer**: Barriers ARE injected simultaneously, but they travel through DIFFERENT Kafka partitions with DIFFERENT lag!
+
+**Visual Timeline**:
+
+```
+t=0s: Checkpoint Coordinator says "Start checkpoint #5!"
+
+SIMULTANEOUS INJECTION:
+├─ Injects BARRIER into Kafka Topic 1 (Account Updates) at t=0s
+└─ Injects BARRIER into Kafka Topic 2 (Transfer Events) at t=0s
+
+But the partitions have different states:
+
+KAFKA TOPIC 1 (Account Updates):
+  Offset 995: Alice=$1000
+  Offset 996: Bob=$500
+  Offset 997: Charlie=$800
+  Offset 998: ★ BARRIER #5 ★  ← Inserted here at t=0s
+  
+  Source operator reading from this topic:
+  - Currently at offset 997 (near the end!)
+  - Only 1 event behind (997 vs 998)
+  - Processes offset 997 → Sees BARRIER at offset 998
+  - Time: t=1s ← FAST!
+
+KAFKA TOPIC 2 (Transfer Events):
+  Offset 990: Transfer: Alice → Bob
+  Offset 991: Transfer: Charlie → David
+  ... (many events)
+  Offset 1007: ★ BARRIER #5 ★  ← Inserted here at t=0s
+  
+  Source operator reading from this topic:
+  - Currently at offset 990 (far behind!)
+  - 17 events behind (990 vs 1007)
+  - Must process offsets 990, 991, 992... 1006 first
+  - Finally sees BARRIER at offset 1007
+  - Time: t=10s ← SLOW! (had to catch up)
+```
+
+**Key Insight**: 
+- **Injection time**: SAME (both at t=0s)
+- **Arrival time at operator**: DIFFERENT (t=1s vs t=10s)
+- **Why different?**: Kafka partition lag (offset gap)
+
+**Real-World Cause**: Topic 2 has consumer lag
+- Maybe Topic 2 had a partition rebalance recently
+- Maybe Topic 2 has slower processing (complex deserialization)
+- Maybe Topic 2 has network issues
+- Result: Source is 17 events behind on Topic 2, only 1 event behind on Topic 1
+
+---
+
 **Concrete Example**:
 
 ```
@@ -1266,35 +1324,36 @@ You have a JOIN operator merging:
 - Input 1: Account balance updates (FAST Kafka partition, low lag)
 - Input 2: Transfer instructions (SLOW Kafka partition, high lag)
 
-Checkpoint #5 starts:
+Checkpoint #5 starts at t=0s (barriers injected into BOTH topics):
 
-INPUT 1 (fast topic, processes quickly):
-  Alice=$1000
-  Bob=$500
-  Charlie=$800
-  ★ BARRIER #5 ★  ← arrives at t=1s (only took 1 second!)
-  Alice=$800      ← Post-barrier events start arriving
-  Bob=$700
-  Charlie=$750
+INPUT 1 (fast topic, LOW LAG - only 1 event behind):
+  Alice=$1000       ← offset 997
+  Bob=$500          ← offset 998  
+  Charlie=$800      ← offset 999
+  ★ BARRIER #5 ★   ← offset 1000 (injected at t=0s)
   
-INPUT 2 (slow topic, 10x slower):
-  Transfer: Alice → Bob ($200)
-  Transfer: Charlie → David ($50)
-  Transfer: Eve → Frank ($100)
-  Transfer: Alice → Bob ($200)  ← Same transfer again?
-  Transfer: Gina → Henry ($75)
-  Transfer: Ivan → Jane ($150)
-  Transfer: Kevin → Lisa ($300)
-  ★ BARRIER #5 ★  ← arrives at t=10s (took 10 seconds!)
+  Source reads 997, 998, 999 → sees barrier at 1000
+  Time: t=1s ← Fast! Only had to process 3 events
+  
+INPUT 2 (slow topic, HIGH LAG - 17 events behind):
+  Transfer: Alice → Bob      ← offset 990 (current position)
+  Transfer: Charlie → David  ← offset 991
+  Transfer: Eve → Frank      ← offset 992
+  ... (14 more transfers at offsets 993-1006)
+  ★ BARRIER #5 ★            ← offset 1007 (injected at t=0s)
+  
+  Source reads 990, 991, 992... 1006 → finally sees barrier at 1007
+  Time: t=10s ← Slow! Had to process 17 events first
 ```
 
 **See the problem?** 
-- Input 1's barrier arrives in **1 second**
-- Input 2's barrier arrives in **10 seconds**
+- Barrier injected at **SAME TIME** (t=0s) in both topics
+- Input 1's barrier **ARRIVES** at JOIN operator at t=1s (fast, low lag)
+- Input 2's barrier **ARRIVES** at JOIN operator at t=10s (slow, high lag)
 - Meanwhile, Input 1 keeps receiving events (Alice=$800, Bob=$700, etc.)
 
 **Question**: When do we take the snapshot?
-- If we snapshot when Input 1's barrier arrives → Input 1 is at "barrier time", but Input 2 is still 9 seconds behind!
+- If we snapshot when Input 1's barrier arrives (t=1s) → Input 2 is still 9 seconds behind!
 - If we keep processing Input 1 → Snapshot will include AFTER-barrier events from Input 1 but BEFORE-barrier events from Input 2 = **INCONSISTENT**!
 
 This is the barrier alignment problem in concrete terms!
