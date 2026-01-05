@@ -270,78 +270,206 @@ public Long getCount(@PathVariable String userId) {
 
 ## 5. End-to-End Walkthrough: Click Aggregation
 
-**Scenario**: Count user clicks per 5-minute window
+**Scenario**: Count user clicks per 5-minute window and expose counts via REST API
 
-### Java Code
+### Step 1: Define the Topology
 
-```java
-public class ClickAggregationApp {
-    public static void main(String[] args) {
-        // 1. Topology Definition
-        StreamsBuilder builder = new StreamsBuilder();
-        
-        // 2. Read stream
-        KStream<String, ClickEvent> clicks = builder.stream(
-            "user-clicks",
-            Consumed.with(Serdes.String(), clickEventSerde())
-        );
-        
-        // 3. Window and aggregate
-        KTable<Windowed<String>, Long> windowedCounts = clicks
-            .groupByKey()
-            .windowedBy(TimeWindows.ofSizeWithNoGrace(Duration.ofMinutes(5)))
-            .count(Materialized.as("click-counts-store"));
-        
-        // 4. Write output
-        windowedCounts
-            .toStream()
-            .map((k, v) -> KeyValue.pair(
-                k.key() + "@" + k.window().start(), 
-                v
-            ))
-            .to("aggregated-clicks", Produced.with(Serdes.String(), Serdes.Long()));
-        
-        // 5. Configure
-        Properties props = new Properties();
-        props.put(StreamsConfig.APPLICATION_ID_CONFIG, "click-aggregator");
-        props.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092");
-        props.put(StreamsConfig.PROCESSING_GUARANTEE_CONFIG, 
-                  StreamsConfig.EXACTLY_ONCE_V2); // Enable exactly-once
-        
-        // 6. Start
-        KafkaStreams streams = new KafkaStreams(builder.build(), props);
-        streams.start();
-        
-        // 7. Shutdown hook
-        Runtime.getRuntime().addShutdownHook(new Thread(streams::close));
-    }
-}
+Create the processing pipeline (this is just configuration, not execution yet):
+
+**Input**: Kafka topic `user-clicks` with events: `{userId: "user123", url: "/home", timestamp: 1704447600}`
+
+**Transformations**:
+1. Group events by `userId`
+2. Create 5-minute tumbling windows
+3. Count events per window
+4. Store results in local state store
+
+**Output**: Kafka topic `aggregated-clicks` with counts: `("user123@10:00:00", 42)`
+
+### Step 2: Configure the Application
+
+Set application-level settings:
+
+**Application ID**: `click-aggregator`
+- Acts as consumer group name
+- Prefixes all internal topics (changelogs, repartition topics)
+
+**Processing Guarantee**: `exactly_once_v2`
+- Kafka transactions ensure no duplicates
+- Atomic commit: output records + state + consumer offsets
+
+**State Directory**: `/tmp/kafka-streams/click-aggregator/`
+- Local RocksDB storage location
+- Each partition gets its own subdirectory
+
+### Step 3: Application Startup (t=0s)
+
+**Join Consumer Group**:
+- Application connects to Kafka cluster
+- Joins consumer group `click-aggregator`
+- Kafka coordinator notices new member
+
+**Partition Assignment**:
+- Coordinator assigns input topic partitions
+- Example: Instance 1 gets partitions [0, 1, 2]
+- Assignment based on number of instances
+
+**State Restoration**:
+- Check if local RocksDB exists for assigned partitions
+- If not, replay changelog topics to rebuild state
+- Restoration time: ~1 minute per 1GB of state
+
+**Ready to Process**: Application starts polling from assigned offsets
+
+### Step 4: Process First Event (t=10s)
+
+**Event Arrives**:
+```
+Partition: 0
+Offset: 1000
+Key: "user123"
+Value: {url: "/home", timestamp: "2024-01-05 10:00:30"}
 ```
 
-### Execution Timeline
+**Window Assignment**:
+- Event timestamp: 10:00:30
+- Window start: 10:00:00 (round down to 5-min boundary)
+- Window end: 10:05:00
+- Window key: `user123@10:00:00`
 
-**t=0s: Application Start**
-- Join consumer group `click-aggregator`
-- Assigned partitions: [0, 1, 2]
-- Restore state from changelog topics (if exists)
+**State Update**:
+1. Read current count from RocksDB: `counts["user123@10:00:00"] = 0`
+2. Increment: `0 + 1 = 1`
+3. Write to RocksDB: `counts["user123@10:00:00"] = 1`
+4. Send to changelog topic: `click-aggregator-click-counts-store-changelog`
 
-**t=10s: Processing**
+**Produce Output**:
+- Key: `"user123@10:00:00"`
+- Value: `1`
+- Topic: `aggregated-clicks`
+- *Note*: Output not visible yet (transaction uncommitted)
+
+### Step 5: Process More Events (t=11s - t=4m)
+
+**Second Event** (same user, same window):
 ```
-Record 1: key="user123", value={url="/home", timestamp=10:00:00}
-  → Window: [10:00:00 - 10:05:00]
-  → State: click-counts-store["user123@10:00:00"] = 1
-  → Output: ("user123@10:00:00", 1)
-
-Record 2: key="user123", value={url="/profile", timestamp=10:01:30}
-  → Same window: [10:00:00 - 10:05:00]
-  → State: click-counts-store["user123@10:00:00"] = 2
-  → Output: ("user123@10:00:00", 2)  // Updated count
+Key: "user123"
+Value: {url: "/profile", timestamp: "2024-01-05 10:01:45"}
 ```
 
-**t=5m: Window Close**
-- Window [10:00:00 - 10:05:00] complete
-- Final count emitted
-- State retained for grace period (if configured)
+**Processing**:
+- Same window: `user123@10:00:00`
+- Read count: `1`
+- Increment: `1 + 1 = 2`
+- Update RocksDB: `counts["user123@10:00:00"] = 2`
+- Produce: `("user123@10:00:00", 2)` ← **Updated count**
+
+**Why Output Multiple Times?**
+- KTable semantics: Emit on every update
+- Downstream consumers see progressive updates
+- Final value at window close is authoritative
+
+### Step 6: Transaction Commit (t=1s intervals)
+
+Every `commit.interval.ms` (default: 1000ms), Kafka Streams commits:
+
+**Atomic Commit**:
+1. All output records produced in last 1 second
+2. All state store updates
+3. Consumer offset advancement
+
+**Kafka Transaction**:
+- `BEGIN TRANSACTION`
+- Write 50 output records to `aggregated-clicks`
+- Write 50 state updates to changelog
+- Commit offset=1050 for partition 0
+- `COMMIT TRANSACTION`
+
+**Result**: Either all visible or none (no partial results)
+
+### Step 7: Window Close (t=10:05:00)
+
+**Event with Later Timestamp**:
+```
+Key: "user456"
+timestamp: "2024-01-05 10:05:30" ← New window
+```
+
+**Watermark Advancement**:
+- Previous window [10:00:00 - 10:05:00] is now closed
+- No more events can arrive for this window (no grace period in this example)
+- State retained for querying
+
+**Final Count**:
+- `user123@10:00:00`: 42 clicks (final)
+- Output record with final=true flag (if configured)
+
+### Step 8: Interactive Query (t=10:06:00)
+
+**REST API Request**: `GET /count/user123?window=2024-01-05T10:00:00`
+
+**Processing**:
+1. Hash `user123` to determine partition owner
+2. Partition 0 → owned by Instance 1 (this instance)
+3. Read from local RocksDB: `counts["user123@10:00:00"]`
+4. Return: `{count: 42, window: "10:00:00-10:05:00"}`
+
+**If Different Instance**:
+- Hash determines Instance 2 owns the key
+- Proxy request: `HTTP GET http://instance-2:8080/count/user123`
+- Instance 2 reads its local RocksDB
+- Return result to client
+
+### Step 9: Rebalance Event (t=15m)
+
+**Trigger**: New application instance added (Instance 3 joins)
+
+**Rebalance Process**:
+1. **Pause Processing**: All instances stop polling
+2. **Revoke Partitions**: Instance 1 releases partition 2
+3. **Assign Partitions**: Partition 2 → Instance 3
+4. **Restore State**: Instance 3 replays `partition-2` changelog
+   - Reads from offset 0 to latest
+   - Rebuilds RocksDB locally
+   - Time: 30 seconds for 100MB state
+5. **Resume**: All instances resume processing
+
+**Exactly-Once Preserved**: No records lost or duplicated during rebalance
+
+### Step 10: Failure Recovery (Instance 1 Crashes)
+
+**Detection**:
+- Instance 1 misses heartbeat (10s default)
+- Kafka coordinator marks it dead
+- Triggers rebalance
+
+**Partition Reassignment**:
+- Partitions [0, 1, 2] previously owned by Instance 1
+- Reassigned to Instances 2 and 3
+- Each restores their new partitions from changelog
+
+**Transaction Rollback**:
+- Instance 1's uncommitted transaction is aborted
+- Last committed offset: 1050
+- New owner starts from offset 1050 (no gaps)
+
+**State Recovery**:
+- Instance 2 replays `partition-0` changelog
+- Rebuilds exact state Instance 1 had at offset 1050
+- Processing resumes with zero data loss
+
+### Performance Summary
+
+| Phase | Duration | Bottleneck |
+|:------|:---------|:-----------|
+| Startup & Join | 2s | Kafka coordinator election |
+| State Restoration | 30s | Changelog replay (100MB @ 3MB/s) |
+| Steady State Processing | Ongoing | Disk writes to RocksDB |
+| Transaction Commit | 10ms | Kafka broker write latency |
+| Rebalance | 35s | State restoration on new owner |
+| Interactive Query | <1ms | Local RocksDB read |
+
+**Throughput**: ~10,000 events/sec per instance (single thread)
 
 ---
 
