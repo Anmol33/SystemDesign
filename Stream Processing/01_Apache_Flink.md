@@ -1416,54 +1416,55 @@ This IS about:
 
 **Real-World Banking Scenario**:
 
-Imagine you're building a fraud detection system. You have:
-- **Input 1**: Account balance updates from the core banking system
-- **Input 2**: Transfer commands that deduct/credit money
+Imagine you're building a fraud detection system. Every transfer has two sides:
+- **Input 1**: Debit stream (money leaving accounts)
+- **Input 2**: Credit stream (money entering accounts)
 
-**The JOIN operator's job**: Match transfers with their corresponding balance updates to verify everything is correct.
+**The JOIN operator's job**: Match debits with credits to verify transfers are complete and correct.
 
 **Example**:
 
 ```
-Input 1 (Balance Updates Stream):
-  Event A: Alice=$1000 (current balance)
-  Event B: Alice=$1000 (status check, no change)
-  Event C: Alice=$800 (balance decreased by $200!)
+Input 1 (Debit Stream):
+  Event A: Debit Alice's account $100
+  Event B: Debit Charlie's account $50
+  Event C: Debit Alice's account $200  ← Alice sends $200
   
-Input 2 (Transfer Commands Stream):
-  Event X: Transfer $100 (Charlie → David)
-  Event Y: Transfer $50 (Eve → Frank)
-  Event Z: Transfer $200 (Alice → Bob)  ← This caused Event C!
+Input 2 (Credit Stream):
+  Event X: Credit David's account $100
+  Event Y: Credit Frank's account $50
+  Event Z: Credit Bob's account $200  ← Bob receives $200
 ```
 
 **What JOIN does**:
 
 ```
 JOIN operator maintains state:
-  - Latest balance for each account (from Input 1)
-  - Pending transfers (from Input 2)
+  - Pending debits: {Alice: $200, Charlie: $50}
+  - Pending credits: {David: $100, Frank: $50, Bob: $200}
+  - Matched transfers: Track which debits matched which credits
 
-When Event Z arrives (Transfer $200 from Alice):
-  1. Check current balance: Alice=$1000 ✓ (has enough)
-  2. Execute transfer
-  3. Wait for confirmation from Input 1
+When Event C arrives (Debit Alice $200):
+  1. Store: "Alice sent $200, waiting for matching credit..."
+  2. Check credits: Is there a $200 credit? Not yet!
+  3. Wait...
   
-When Event C arrives (Alice=$800):
-  1. JOIN sees: Alice's balance dropped by $200
-  2. Match with Transfer Z
-  3. Verify: Did we execute a $200 transfer? YES ✓
-  4. Conclusion: Transfer successful!
+When Event Z arrives (Credit Bob $200):
+  1. Store: "Bob received $200"
+  2. Check debits: Is there a pending $200 debit? YES! (Alice)
+  3. Match them! ✓
+  4. Output: "Transfer complete: Alice → Bob $200"
 ```
 
 **Why BOTH inputs matter**:
-- **Input 2 alone**: Can't verify if transfer succeeded (what if it failed?)
-- **Input 1 alone**: Can't explain WHY balance changed (fraud? transfer? error?)
-- **JOIN together**: Can verify transfers match balance changes
+- **Debit alone**: Money left Alice, but did Bob receive it? (Could be lost!)
+- **Credit alone**: Bob got $200, but from who? (Could be fraud!)
+- **JOIN together**: Verify transfer is complete (debit matches credit)
 
 **The JOIN operator's state contains**:
-- **From Input 1**: Alice=$1000 (latest balance)
-- **From Input 2**: Transfer $200 pending (waiting for confirmation)
-- **Action**: Execute transfer, wait for balance update, verify
+- **From Input 1**: Pending debits waiting for matching credits
+- **From Input 2**: Pending credits waiting for matching debits
+- **Action**: Match debit + credit, verify transfer complete
 
 Now you understand what JOIN does! Let's see how it works normally:
 
@@ -1471,33 +1472,33 @@ Now you understand what JOIN does! Let's see how it works normally:
 
 #### Happy Flow: How JOIN Works Normally (No Checkpoints)
 
-**Question**: "JOIN has to wait for matching events like Z and C, right? Doesn't matter how much Kafka lag there is?"
+**Question**: "JOIN has to wait for matching events, right? Doesn't matter how much Kafka lag there is?"
 
 **Answer**: **Exactly!** Let me show you the normal flow:
 
 ```
 Normal operation (no barriers, no checkpoints):
 
-t=1s: Event Z arrives (Transfer $200: Alice → Bob)
+t=1s: Event C arrives (Debit Alice $200)
       JOIN state:
-        - Alice balance: $1000 (from earlier Event A)
-        - Pending transfer: $200 (from Event Z)
+        - Pending debits: {Alice: $200}
+        - Pending credits: {}
       
-      JOIN waits... doesn't matter if Input 1 has lag!
+      JOIN waits for matching credit... doesn't matter if Input 2 has lag!
       
-t=5s: Event C arrives (Alice=$800)
+t=5s: Event Z arrives (Credit Bob $200)
       JOIN sees:
-        - Balance dropped by $200
-        - We have pending transfer of $200
-        - Match! ✓
+        - Pending debit: Alice $200
+        - New credit: Bob $200
+        - Amounts match! ✓
       
-      JOIN concludes: Transfer successful!
-      Output: "Transfer Z verified ✓"
+      JOIN concludes: Transfer complete!
+      Output: "Alice → Bob $200 verified ✓"
 ```
 
 **Key Point**: JOIN **waits for matching events** regardless of lag!
-- Event Z arrives → JOIN stores it, waits
-- Event C arrives 4 seconds later → JOIN matches them
+- Event C arrives (debit) → JOIN stores it, waits
+- Event Z arrives 4 seconds later (credit) → JOIN matches them
 - **Lag doesn't matter** for normal operation!
 
 ---
@@ -1505,13 +1506,13 @@ t=5s: Event C arrives (Alice=$800)
 **Another Example: Extreme Lag**
 
 ```
-t=1s: Event Z arrives (Transfer $200)
-      JOIN: "I'll wait for the balance update..."
+t=1s: Event C arrives (Debit Alice $200)
+      JOIN: "I'll wait for the matching credit..."
       
-t=1min: Still waiting... (Input 1 has 1-minute lag!)
+t=1min: Still waiting... (Input 2 has 1-minute lag!)
         
-t=1min: Event C finally arrives (Alice=$800)
-        JOIN: "There it is! Matched ✓"
+t=1min: Event Z finally arrives (Credit Bob $200)
+        JOIN: "There it is! Alice $200 debit + Bob $200 credit = Matched ✓"
 ```
 
 **Normal operation handles lag perfectly!** JOIN just waits.
