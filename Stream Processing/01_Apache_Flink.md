@@ -1012,102 +1012,53 @@ stream
 ### Critical Metrics
 
 ```
-checkpoint_duration_p95: < 60 seconds
-  High duration = large state, slow storage, or skew
+checkpoint_duration_milliseconds:
+  Description: Time to complete distributed snapshot
+  Target: < 60 seconds (95th percentile)
+  Why it matters: Long checkpoints = wide recovery window, more data reprocessed on failure
+  Fix: Enable unaligned checkpoints, reduce state size with TTL, use faster storage (S3 vs HDFS)
 
-checkpoint_failure_rate: < 1%
-  Failures = lost recovery points, wider recovery window
+checkpoint_failure_count_total:
+  Description: Count of failed checkpoint attempts
+  Target: < 1% of total checkpoints
+  Why it matters: Failed checkpoints = no recovery points, wider blast radius on failures
+  Fix: Increase checkpoint timeout, fix data skew, verify S3 connectivity
 
-kafka_consumer_lag: < 10000 messages
-  Growing lag = backpressure or slow processing
+kafka_consumer_lag_messages:
+  Description: Number of unprocessed messages in Kafka
+  Target: < 10,000 messages per partition
+  Why it matters: Growing lag = processing slower than input rate, backpressure active
+  Fix: Scale parallelism, optimize sink (async I/O), increase TaskManager count
 
-backpressure_time_percentage: < 5%
-  Sustained backpressure = sink bottleneck
+backpressure_time_percentage:
+  Description: Percentage of time tasks are blocked waiting for credits
+  Target: < 5%
+  Why it matters: Sustained backpressure = sink bottleneck, throughput degradation
+  Fix:Identify slow operator (Flink Web UI), use async I/O for external calls, scale sink parallelism
 
-task_failure_rate: < 0.1%
-  High failure = instability, resource issues
+task_failure_count_total:
+  Description: Count of individual task failures (before job restart)
+  Target: < 0.1% of total tasks
+  Why it matters: High failure rate = instability, resource contention, or bugs
+  Fix: Check logs for OOM/exceptions, increase memory, fix code bugs
 
-state_size_mb: Monitor growth rate
-  Unbounded growth = missing TTL or cascading state
+state_size_bytes:
+  Description: Total state backend size (RocksDB on disk)
+  Target: Monitor growth rate (should be bounded)
+  Why it matters: Unbounded growth = missing TTL, eventual OOM or slow checkpoints
+  Fix: Configure state TTL (30-90 days typical), investigate state accumulation bugs
 
-throughput_records_per_second: Baseline for regression
-  Sudden drop = backpressure, failures, or skew
+throughput_records_per_second:
+  Description: Records processed per second (baseline for regression detection)
+  Target: Establish baseline, alert on >20% drop
+  Why it matters: Sudden drop = backpressure, failures, data skew, or resource exhaustion
+  Fix: Investigate backpressure, check for failures, verify resource allocation
 
-gc_time_percentage: < 10%
-  RocksDB should prevent GC issues (off-heap state)
-```
-
-### Troubleshooting Commands
-
-```bash
-# Check backpressure (Flink REST API)
-curl http://jobmanager:8081/jobs/<job-id>/vertices/<vertex-id>/backpressure
-
-Output:
-{
-  "status": "ok",  # or "low", "high"
-  "backpressure-level": 0.15,  # < 0.1 = OK
-  "idle-time-percentage": 85  # > 80 = healthy
-}
-
-# View checkpoint statistics
-curl http://jobmanager:8081/jobs/<job-id>/checkpoints
-
-Output:
-{
-  "latest-acked": {..., "duration": 45000},  # 45s
-  "failed_count": 2,
-  "restored_from": "checkpoint-5"
-}
-
-# Check Kafka lag
-kafka-consumer-groups --bootstrap-server kafka:9092 \
-  --group flink-consumer-group \
-  --describe
-
-Output:
-GROUP          TOPIC     PARTITION  LAG
-flink-group    events    0          5234  # < 10k = OK
-
-# TaskManager logs (Kubernetes)
-kubectl logs flink-taskmanager-0 | grep -i "exception\|error\|warn"
-
-# Check state backend size
-kubectl exec -it flink-taskmanager-0 -- \
-  du -sh /opt/flink/state
-```
-
-### Monitoring Alerts
-
-```
-Alert: checkpoint_duration > 180s for 3 checkpoints
-Action: Check for:
-  - State growth (need TTL?)
-  - Slow S3 writes (network issue?)
-  - Data skew (use unaligned checkpoints)
-
-Alert: checkpoint_failure_rate > 5% for 10 minutes
-Action:
-  - Check JobMaster logs for timeout/exceptions
-  - Verify S3 connectivity
-  - Increase checkpoint timeout
-
-Alert: kafka_consumer_lag > 50000 for 5 minutes
-Action:
-  - Check backpressure (sink bottleneck?)
-  - Increase parallelism
-  - Scale TaskManagers horizontally
-
-Alert: backpressure_percentage > 20% for 10 minutes
-Action:
-  - Identify slow operator (Flink UI metrics)
-  - Use async I/O for database writes
-  - Increase sink parallelism
-
-Alert: state_size growth_rate > 10 GB/hour
-Action:
-  - Configure state TTL (likely missing)
-  - Investigate runaway state (bug?)
+gc_time_percentage:
+  Description: Percentage of time spent in JVM garbage collection
+  Target: < 10% (off-heap RocksDB should minimize GC)
+  Why it matters: High GC = heap pressure, performance degradation
+  Fix: RocksDB state backend uses off-heap (verify config), increase managed memory fraction
 ```
 
 ---
