@@ -1,6 +1,6 @@
 # Apache Flink: Stream Processing with Exactly-Once Guarantees
 
-## 1. Introduction
+## Introduction
 
 ### The Scenario: Why Batch Processing Fails
 
@@ -191,7 +191,7 @@ Flink's **Chandy-Lamport distributed snapshots** enable exactly-once processing 
 
 ---
 
-## 2. Core Architecture: Following a Job's Journey
+## Core Architecture: Following a Job's Journey
 
 **Scenario**: You've written a fraud detection job. Let's follow it from submission to execution to understand how Flink's architecture works.
 
@@ -450,7 +450,7 @@ Event arrives →
 - Optimization to avoid network overhead
 - But logically they're still separate operators
 
-## 3. How It Works: Solving Real Problems with Event-Time and State
+## How It Works: Solving Real Problems with Event-Time and State
 
 **Scenario**: You're building analytics for a mobile shopping app. You want to count "product views per user in 5-minute windows" to detect trending products.
 
@@ -811,9 +811,9 @@ New event arrives: {user: "alice", product: "case", time: 10:06}
 
 ---
 
-## 4. Deep Dive: Internal Mechanisms
+## Deep Dive: Internal Mechanisms
 
-### A. Checkpoint Mechanism: Preventing Duplicate Processing
+### Checkpoint Mechanism: Preventing Duplicate Processing
 
 **Scenario**: You're running a banking app on Flink that processes money transfers.
 
@@ -1367,7 +1367,7 @@ env.getCheckpointConfig()
 ---
 
 
-### B. Exactly-Once Sink: Preventing Duplicate Alerts
+### Exactly-Once Sink: Preventing Duplicate Alerts
 
 **Scenario**: Your fraud detection system sends alerts to Kafka when suspicious activity is detected.
 
@@ -1624,7 +1624,7 @@ FlinkKafkaProducer.Semantic.AT_LEAST_ONCE
 ---
 
 
-### C. Credit-Based Backpressure: Preventing Memory Overflow
+### Credit-Based Backpressure: Preventing Memory Overflow
 
 **Scenario**: You're reading events from Kafka and writing to a PostgreSQL database.
 
@@ -1936,7 +1936,7 @@ Fix backpressure in Flink
 ---
 
 
-## 5. End-to-End Walkthrough: Fraud Detection Pipeline
+## End-to-End Walkthrough: Fraud Detection Pipeline
 
 **Scenario**: You're building a real-time fraud detection system for a bank. The system processes credit card transactions and sends alerts when suspicious patterns are detected.
 
@@ -2345,7 +2345,7 @@ Consistency. Flink must ensure all operators see consistent state (from checkpoi
 ---
 
 
-## 6. Failure Scenarios (The Senior View)
+## Failure Scenarios (The Senior View)
 
 ### Scenario A: Backpressure Deadlock
 
@@ -2562,7 +2562,7 @@ Checkpoint triggers:
 
 ---
 
-## 7. Performance Tuning / Scaling Strategies
+## Performance Tuning / Scaling Strategies
 
 ### Configuration Table
 
@@ -2611,7 +2611,7 @@ Checkpoint triggers:
 
 ---
 
-## 8. Constraints & Limitations
+## Constraints & Limitations
 
 | Constraint | Limit | Why? |
 |:-----------|:------|:-----|
@@ -2638,7 +2638,7 @@ Checkpoint triggers:
 
 ---
 
-## 9. When to Use Flink?
+## When to Use Flink?
 
 | Use Case | Verdict | Why? |
 |:---------|:--------|:-----|
@@ -2666,7 +2666,7 @@ Checkpoint triggers:
 
 ---
 
-## 10. Production Checklist
+## Production Checklist
 
 1. [ ] **Enable checkpointing**: `execution.checkpointing.interval=60000` (60s)
 2. [ ] **Use RocksDB state backend**: `state.backend=rocksdb`
