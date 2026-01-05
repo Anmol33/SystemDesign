@@ -48,10 +48,10 @@ GraphQL operates as a type system layer between client and data sources.
 
 ```mermaid
 graph TD
-    subgraph Client["Client Application"]
+    subgraph ClientApp["Client Application"]
         UI["UI Component"]
         Query["GraphQL Query"]
-        Client["GraphQL Client (Apollo)"]
+        GQLClient["GraphQL Client (Apollo)"]
     end
     
     subgraph Server["GraphQL Server"]
@@ -67,15 +67,15 @@ graph TD
     end
     
     UI --> Query
-    Query --> Client
-    Client --> Endpoint
+    Query --> GQLClient
+    GQLClient --> Endpoint
     Endpoint --> Schema
     Schema --> Resolvers
     Resolvers --> DB
     Resolvers --> REST
     Resolvers --> Redis
     
-    style Client fill:#e6f3ff
+    style ClientApp fill:#e6f3ff
     style Server fill:#fff3cd
     style Data fill:#e6ffe6
 ```
