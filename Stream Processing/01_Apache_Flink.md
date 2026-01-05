@@ -2,6 +2,65 @@
 
 ## 1. Introduction
 
+### The Scenario: Why Batch Processing Fails
+
+**Imagine you're building a fraud detection system for credit card transactions**:
+
+**Timeline**:
+- **12:00:00 PM**: Customer's card used to buy $50 coffee in New York
+- **12:00:03 PM**: Same card used to buy $5,000 laptop in London
+- **12:00:05 PM**: Same card used to buy $2,000 phone in Tokyo
+
+**The Problem**:
+- These transactions happen **3 seconds apart**
+- Physically impossible (can't travel NYC → London → Tokyo in 5 seconds)
+- **This is fraud** and must be blocked immediately
+
+**Batch Processing Approach** (Hadoop/Spark batch jobs):
+```
+Hour 1: Transactions accumulate in database
+Hour 2: Batch job starts processing
+Hour 3: Job detects fraud pattern
+Hour 4: Alert generated
+
+Result: Fraud detected 4 hours later
+        $7,050 already stolen
+        Too late to block
+```
+
+**Stream Processing Requirement** (Flink):
+```
+12:00:00: NYC transaction → processed
+12:00:03: London transaction arrives
+          → Flink checks: "Last transaction 3 seconds ago in NYC"
+          → Distance: 3,459 miles
+          → Time to travel at 767 mph (plane): 4.5 hours
+          → Verdict: IMPOSSIBLE → BLOCK TRANSACTION
+          
+Result: Fraud blocked in 10 milliseconds
+        Customer protected
+        $7,000 saved
+```
+
+**Why Batch Fails**:
+- **Latency**: Processes data in hourly/daily batches
+- **Stale data**: Decisions made on old information
+- **No real-time state**: Can't check "what happened 3 seconds ago"
+
+**Why Stream Processing is Mandatory**:
+- **Sub-second decisions**: Detect and block within milliseconds
+- **Stateful processing**: Remembers recent transactions per user
+- **Event-time correctness**: Handles out-of-order events (London transaction arrives before Tokyo)
+- **Continuous computation**: Always running, always protecting
+
+**Other Scenarios Where Batch is Inadequate**:
+1. **Ride-sharing pricing**: Surge pricing based on current demand (not yesterday's demand)
+2. **Stock trading**: Detect market manipulation patterns in real-time
+3. **IoT monitoring**: Alert when sensor reading anomalous (not hours later when equipment already failed)
+4. **Recommendation systems**: Update user profile as they click (not next day)
+
+---
+
 **Apache Flink** is an open-source, distributed stream processing framework designed for **stateful computations over unbounded and bounded data streams**. Unlike Spark (batch-first with streaming as an afterthought), Flink is **stream-native from the ground up**, treating batch as a special case of streaming.
 
 ### The Problem: Batch is Too Slow
