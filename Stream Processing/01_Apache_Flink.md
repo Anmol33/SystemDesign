@@ -107,29 +107,64 @@ Typical: 500ms + 500ms = 1 second minimum
 **Core Innovations**:
 
 **1. True Streaming** (not micro-batch)
-- Long-running operators passing messages
-- Latency: 1-100ms (network overhead only)
-- No scheduler delay
+
+Unlike Spark's micro-batch approach (which processes data in 500ms chunks), Flink uses **long-running operators** that continuously pass messages between each other. This means:
+- **No artificial batching**: Events processed individually as they arrive
+- **Ultra-low latency**: 1-100ms end-to-end (only network overhead)
+- **No scheduler delay**: Operators stay running; no JVM startup for each batch
+- **Continuous computation**: Like a pipeline where data flows continuously, not in chunks
+
+**Why it matters**: Fraud detection needs decisions in <100ms, impossible with 500ms+ micro-batches.
+
+---
 
 **2. Exactly-Once via Chandy-Lamport Snapshots**
-- Distributed snapshots without stopping data flow
-- State checkpointed to durable storage (S3, HDFS)
-- Failure recovery: Restore from last checkpoint
+
+Flink achieves **exactly-once processing** without pausing the data stream. The mechanism:
+- **Distributed snapshots**: Takes a consistent snapshot of entire job state while processing continues
+- **Checkpoint barriers**: Special markers flow with data to coordinate snapshots across operators
+- **Durable storage**: State saved to S3/HDFS (survives machine failures)
+- **Failure recovery**: On crash, restore state from last successful checkpoint and replay from that point
+
+**Why it matters**: Guarantees no data loss and no duplicates, even when machines fail mid-processing. Critical for financial transactions where "exactly once" is legally required.
+
+---
 
 **3. Advanced State Management**
-- Embedded RocksDB for TB-scale state per operator
-- Queryable state (external systems can query running job)
-- Incremental checkpoints (only save deltas)
+
+Flink can maintain **massive amounts of state** (terabytes) efficiently:
+- **Embedded RocksDB**: Each operator has local LSM-tree database stored on SSD (not RAM)
+- **Off-heap storage**: State lives outside JVM to avoid garbage collection pauses
+- **TB-scale per operator**: Single operator can manage terabytes of state (user sessions, aggregations)
+- **Queryable state**: External systems can query running job's state via REST API (e.g., "What's the current count for user123?")
+- **Incremental checkpoints**: Only save changed data, not entire state (100GB state → 5GB checkpoint)
+
+**Why it matters**: Enables stateful computations like "count all events per user in last 30 days" without external databases. State co-located with computation = fast lookups.
+
+---
 
 **4. Event-Time Processing**
-- **Watermarks**: Track progress of event time
-- Out-of-order handling: Buffer late events
-- Correct results despite network delays
+
+Flink processes events based on **when they happened** (event time), not when they arrived (processing time). This handles:
+- **Out-of-order events**: Mobile app generates event at 10:00 AM, arrives at 10:05 AM due to network delay
+- **Watermarks**: Flink tracks "event time progress" using watermarks (guarantees like "no events before 10:00 AM will arrive")
+- **Late event buffering**: Holds events temporarily to wait for stragglers
+- **Correct window results**: 5-minute window from 10:00-10:05 includes all events with timestamps in that range, regardless of arrival time
+
+**Why it matters**: Getting accurate "clicks in last hour" when events arrive out of order. Without event-time, results would be wrong.
+
+---
 
 **5. Credit-Based Backpressure**
-- Receivers advertise available buffer space ("credits")
-- Senders only send when credits available
-- Natural flow control (no reactive throttling)
+
+Flink prevents memory overflows using a **flow control** system:
+- **Credit system**: Downstream operators advertise "I have 10 free buffers" to upstream
+- **Sender respects credits**: Upstream only sends data if downstream has space
+- **Natural throttling**: When downstream is slow, upstream automatically slows down (no manual tuning)
+- **Prevents OOM**: Can't overwhelm operators with more data than they can handle
+- **Propagates to source**: Backpressure flows all the way to Kafka source (stops reading when system full)
+
+**Why it matters**: **Reactive** backpressure (Spark) waits for OOM, then crashes. **Proactive** backpressure (Flink) prevents crashes before they happen.
 
 ---
 
