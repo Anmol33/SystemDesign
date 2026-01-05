@@ -2614,7 +2614,7 @@ Checkpoint triggers:
 ## Constraints & Limitations
 
 | Constraint | Limit | Why? |
-|:-----------|:------|:-----|
+|------------|-------|------|
 | **Checkpoint size** | < 100GB recommended | Large checkpoints slow recovery (30s → 5min) |
 | **State size** | TB-scale with RocksDB | Limited by disk, not RAM (SSD recommended) |
 | **Parallelism max** | 1000s (practical: 100-500) | Too high = coordination overhead, small tasks |
@@ -2629,7 +2629,7 @@ Checkpoint triggers:
 ### Why Not Flink?
 
 | Use Case | Better Alternative | Reason |
-|:---------|:-------------------|:-------|
+|----------|-------------------|--------|
 | **Batch ETL only** | Apache Spark | More mature batch ecosystem, SQL integration |
 | **< 1GB/day throughput** | Kafka Streams | Simpler deployment (library, not cluster) |
 | **Simple map/filter** | Kafka Streams/KSQL | No need for Flink's complexity |
@@ -2641,7 +2641,7 @@ Checkpoint triggers:
 ## When to Use Flink?
 
 | Use Case | Verdict | Why? |
-|:---------|:--------|:-----|
+|----------|---------|------|
 | **Real-time analytics** | **YES** ✅ | Sub-second latency, event-time windows, exactly-once |
 | **Fraud detection** | **YES** ✅ | Stateful pattern matching (CEP), complex rules |
 | **Stream joins** | **YES** ✅ | More mature than Spark (interval joins, temporal joins) |
@@ -2654,7 +2654,7 @@ Checkpoint triggers:
 ### Flink vs Alternatives
 
 | Aspect | Flink | Spark Streaming | Kafka Streams |
-|:-------|:------|:----------------|:--------------|
+|--------|-------|-----------------|---------------|
 | **Latency** | 1-100ms | 500ms-5s | 1-10ms |
 | **State** | Advanced (RocksDB, queryable) | Limited (memory) | RocksDB |
 | **Exactly-once** | Native (Chandy-Lamport) | Micro-batch | Native (changelog) |
