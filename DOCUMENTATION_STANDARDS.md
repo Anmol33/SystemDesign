@@ -268,6 +268,40 @@ Now let's see WHY each component exists...
 
 ---
 
+#### 6. **Visual First for Complex Systems**
+
+**Mandatory**: Every distributed system concept MUST include a Mermaid diagram.
+
+**Why Diagrams Are Essential**:
+- **Spatial understanding**: Text cannot show "Dispatcher sits above JobMaster"
+- **Flow visibility**: Arrows make data movement obvious
+- **Mental models**: Visual learners need pictures, not just words
+- **Debugging aid**: Readers can point to diagram: "the problem is HERE"
+
+**Diagram Types**:
+
+| Use Case | Type | Example |
+|----------|------|---------|
+| Component architecture | `graph TB` | Flink cluster structure |
+| Data/Event flow | `flowchart LR` | Event-time processing |
+| Time-based interactions | `sequenceDiagram` | Checkpoint coordination |
+| State transitions | `stateDiagram-v2` | Job lifecycle |
+
+**Mermaid Best Practices**:
+1. Label all arrows (`"Submit JAR"`, `"Deploy"`)
+2. Use subgraphs to group components
+3. Add timing notes where relevant
+4. Style critical paths (`style CRITICAL fill:#ff9999`)
+5. Quote labels with special chars
+
+**Minimum Requirements**:
+- Section 2 (Architecture): 1 component diagram
+- Section 3 (How It Works): 1-2 flow diagrams
+- Section 4 (Deep Dive): 2-3 sequence diagrams  
+- Section 5 (Walkthrough): 1 end-to-end sequence
+
+---
+
 ### Anti-Patterns to Avoid
 
 ❌ **Reference-style bullet points**:

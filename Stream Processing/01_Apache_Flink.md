@@ -447,6 +447,64 @@ If TaskManager crashes:
 
 This separation enables isolation (jobs don't interfere), flexibility (works on K8s/YARN), and resilience (job-level failure recovery).
 
+---
+
+### Flink Cluster Architecture
+
+```mermaid
+graph TB
+    subgraph JobManager["JobManager Pod"]
+        Dispatcher["Dispatcher<br/>(Entry Point)"]
+        JM1["JobMaster<br/>(Job A)"]
+        JM2["JobMaster<br/>(Job B)"]
+        RM["ResourceManager<br/>(Slots)"]
+    end
+    
+    subgraph TM1["TaskManager Pod 1<br/>(8GB RAM)"]
+        TS1["Task Slot 1<br/>(Source)"]
+        TS2["Task Slot 2<br/>(Map)"]
+        RDB1[("RocksDB<br/>(State)")]
+    end
+    
+    subgraph TM2["TaskManager Pod 2<br/>(8GB RAM)"]
+        TS3["Task Slot 3<br/>(Aggregate)"]
+        TS4["Task Slot 4<br/>(Sink)"]
+        RDB2[("RocksDB<br/>(State)")]
+    end
+    
+    Client["User<br/>(Submit JAR)"] -->|"1. Submit Job"| Dispatcher
+    Dispatcher -->|"2. Create JobMaster"| JM1
+    JM1 -->|"3. Request Resources"| RM
+    RM -->|"4. Allocate Slots"| TM1
+    RM -->|"4. Allocate Slots"| TM2
+    JM1 -->|"5. Deploy Tasks"| TS1
+    JM1 -->|"5. Deploy Tasks"| TS2
+    JM1 -->|"5. Deploy Tasks"| TS3
+    JM1 -->|"5. Deploy Tasks"| TS4
+    
+    TS1 -.->|"Network Buffer<br/>(Data Flow)"| TS2
+    TS2 -.->|"Network Buffer<br/>(Data Flow)"| TS3
+    TS3 -.->|"Network Buffer<br/>(Data Flow)"| TS4
+    
+    TS2 <-.->|"Read/Write State"| RDB1
+    TS3 <-.->|"Read/Write State"| RDB2
+    
+    style Dispatcher fill:#99ccff
+    style JM1 fill:#99ff99
+    style RM fill:#ffcc99
+    style TS1 fill:#ffff99
+    style TS2 fill:#ffff99
+    style TS3 fill:#ffff99
+    style TS4 fill:#ffff99
+```
+
+**Diagram Explanation**:
+- **JobManager**: Control plane (coordinates)
+- **TaskManagers**: Data plane (execute)
+- **Solid arrows**: Control messages (job submission, deployment)
+- **Dashed arrows**: Data flow (events between operators)
+- **RocksDB**: Off-heap state storage (survives crashes)
+
 ## 3. How It Works: Solving Real Problems with Event-Time and State
 
 **Scenario**: You're building analytics for a mobile shopping app. You want to count "product views per user in 5-minute windows" to detect trending products.
@@ -558,6 +616,47 @@ Watermark(10:05) flows through → "No events before 10:05 will arrive"
 2. Calculates: "Latest timestamp = 10:05, tolerance = 2 minutes"
 3. Emits: Watermark(10:03) = "No events before 10:03 will arrive"
 4. When Watermark reaches window end (10:05), trigger computation
+
+---
+
+### Event-Time Processing Flow
+
+```mermaid
+flowchart TB
+    E1["Event 1<br/>{time: 10:00}"] --> WM_CHECK{"Latest timestamp?"}
+    E2["Event 2<br/>{time: 10:01}"] --> WM_CHECK
+    E3["Event 3<br/>{time: 10:03}"] --> WM_CHECK
+    
+    WM_CHECK --> |"Max = 10:03"| EMIT_WM["Emit Watermark(10:01)<br/>(10:03 - 2min tolerance)"]
+    
+    EMIT_WM --> WINDOWS{"Check Windows"}
+    
+    WINDOWS --> W1["Window 10:00-10:05<br/>Status: ACTIVE<br/>(Watermark < 10:05)"]
+    
+    E4["Event 4<br/>{time: 10:04}"] --> W1
+    E5["Event 5<br/>{time: 10:05}"] --> TRIGGER
+    
+    TRIGGER["Watermark(10:05) arrives"] --> CLOSE_WIN["Close Window 10:00-10:05<br/>Compute: 4 events"]
+    
+    CLOSE_WIN --> OUTPUT["Emit Result:<br/>(alice, 4 views)"]
+    
+    LATE["Late Event<br/>{time: 10:02}<br/>arrives at 10:08"] -.->|"After watermark"| DROP{"Grace period?"}
+    DROP -->|"No"| DISCARD["Drop event"]
+    DROP -->|"Yes (1 min)"| UPDATE["Update result<br/>or side output"]
+    
+    style EMIT_WM fill:#99ccff
+    style TRIGGER fill:#ffcc99
+    style CLOSE_WIN fill:#99ff99
+    style LATE fill:#ff9999
+    style DISCARD fill:#ff6666
+```
+
+**Diagram Shows**:
+1. **Events arrive** with timestamps (event time)
+2. **Watermark emitted** based on max timestamp - tolerance
+3. **Window stays open** until watermark >= window end
+4. **Trigger fires** when watermark reaches window boundary
+5. **Late events** handled based on grace period configuration
 
 ---
 
@@ -1227,6 +1326,41 @@ Source:
 
 ---
 
+### Credit Flow Diagram
+
+```mermaid
+sequenceDiagram
+    participant Src as Source Operator
+    participant Map as Map Operator
+    participant Sink as Sink Operator<br/>(10 buffers)
+    
+    Note over Sink: Has 10 free buffers (32KB each)
+    Sink->>Map: Grant 10 credits
+    Note over Map: Receives 10 credits
+    
+    Map->>Sink: Send buffer 1 (32KB)
+    Note over Map: Credits: 10 → 9
+    Map->>Sink: Send buffer 2
+    Note over Map: Credits: 9 → 8
+    Note over Sink: Buffers filling up...
+    
+    Map->>Sink: Send buffer 10
+    Note over Map: Credits: 1 → 0 (BLOCKED)
+    Note over Map: Stop accepting from Source
+    
+    Note over Sink: Processing data...
+    Sink->>Map: Buffer freed, grant 1 credit
+    Note over Map: Credits: 0 → 1 (UNBLOCKED)
+    
+    Map->>Sink: Resume sending
+    
+    Note over Map: Credits exhausted again
+    Map->>Src: No credits, BLOCK
+    Note over Src: Stop reading from Kafka<br/>Kafka lag increases
+```
+
+---
+
 ### Why This Works: Flow Control
 
 **Analogy**: Traffic lights on highway on-ramp
@@ -1398,6 +1532,58 @@ flink run -d \
 - 16 parallel tasks (matches Kafka partitions)
 - JobManager: 2GB RAM (coordinates)
 - TaskManager: 8GB RAM each (executes)
+
+---
+
+### Job Deployment Sequence
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Disp as Dispatcher
+    participant JM as JobMaster
+    participant RM as ResourceManager
+    participant K8s as Kubernetes
+    participant TM as TaskManager
+    
+    User->>Disp: Submit fraud-detection.jar
+    Note over Disp: Parse JobGraph<br/>Validate config
+    Disp->>JM: Create JobMaster (job-abc123)
+    Note over JM: Analyze graph<br/>Need 64 task slots
+    
+    JM->>RM: Request 64 task slots
+    Note over RM: Currently: 0 TaskManagers<br/>Need: 4 pods
+    
+    RM->>K8s: Create pod flink-tm-1 (8GB)
+    RM->>K8s: Create pod flink-tm-2 (8GB)
+    RM->>K8s: Create pod flink-tm-3 (8GB)
+    RM->>K8s: Create pod flink-tm-4 (8GB)
+    
+    K8s-->>TM: Start TaskManager pods (10s)
+    TM->>RM: Register (16 slots available)
+    Note over RM: Total: 64 slots ready
+    
+    RM-->>JM: Resources allocated
+    
+    JM->>TM: Deploy Source tasks (0-15)
+    JM->>TM: Deploy Map tasks (0-15)
+    JM->>TM: Deploy Aggregate tasks (0-15)
+    JM->>TM: Deploy Sink tasks (0-15)
+    
+    Note over TM: Initialize RocksDB<br/>Establish network connections
+    TM-->>JM: All tasks RUNNING
+    
+    JM-->>User: Job RUNNING (job-abc123)
+    Note over User: Total time: ~12 seconds
+```
+
+**Sequence Highlights**:
+- **User → Dispatcher**: Job submission (t=0s)
+- **Dispatcher → JobMaster**: Dedicated coordinator created (t=0.5s)
+- **JobMaster → ResourceManager**: Resource request (t=0.6s)
+- **ResourceManager → Kubernetes**: Pod provisioning (t=10s)
+- **TaskManagers → JobMaster**: Task deployment (t=12s)
+- **Result**: Job processing events at t=12.001s
 
 ---
 
