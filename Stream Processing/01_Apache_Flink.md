@@ -1263,6 +1263,37 @@ This is CONSISTENT:
 
 #### CRITICAL: Why Do Barriers Arrive at Different Times?
 
+**Pipeline Architecture**:
+
+```mermaid
+graph LR
+    subgraph Kafka["Kafka Cluster"]
+        T1["Topic 1: Account Updates<br/>Offset: 995-1000<br/>LOW LAG (1 event behind)"]
+        T2["Topic 2: Transfer Events<br/>Offset: 990-1007<br/>HIGH LAG (17 events behind)"]
+    end
+    
+    subgraph FlinkJob["Flink Job"]
+        S1["Source Operator 1<br/>(Reading Topic 1)<br/>Current: offset 997"]
+        S2["Source Operator 2<br/>(Reading Topic 2)<br/>Current: offset 990"]
+        JOIN["JOIN Operator<br/>(Merges both inputs)"]
+    end
+    
+    T1 -->|"Fast: 1 event to process"| S1
+    T2 -->|"Slow: 17 events to process"| S2
+    S1 -->|"Input 1"| JOIN
+    S2 -->|"Input 2"| JOIN
+    
+    style T1 fill:#99ff99
+    style T2 fill:#ff9999
+    style S1 fill:#99ff99
+    style S2 fill:#ff9999
+    style JOIN fill:#ffcc99
+```
+
+**This is the DAG we're working with!**
+
+---
+
 **Your Question**: "If barriers are injected at the SAME TIME, why does one arrive faster than the other?"
 
 **Answer**: Barriers ARE injected simultaneously, but they travel through DIFFERENT Kafka partitions with DIFFERENT lag!
