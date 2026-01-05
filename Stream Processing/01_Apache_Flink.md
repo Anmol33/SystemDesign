@@ -1399,87 +1399,154 @@ This is the barrier alignment problem in concrete terms!
 
 #### Concrete Example: Bank Transfer ($200 Duplication Problem)
 
-**Setup**: JOIN operator merging two Kafka topics:
+**STOP! Let me first clarify the core confusion:**
 
-```
-Account Updates (Topic 1) ───┐
-                              ├──→ [JOIN] → Update Balances
-Transfer Events (Topic 2) ───┘
-```
+This is NOT about:
+- ❌ "Operator 1 snapshots at 10:10, Operator 2 snapshots at 10:05"
+- ❌ Two different operators taking snapshots at different times
 
-**Events Timeline**:
-
-```
-INPUT 1 (Account Updates - fast):
-  A1: Alice=$1000, Bob=$500
-  A2: Alice=$1000, Bob=$500 (status check)
-  BARRIER #5 arrives at t=1s
-  A3: Alice=$800, Bob=$700   ← $200 transfer happened
-  A4: (more updates...)
-
-INPUT 2 (Transfer Events - slow due to lag):
-  T1:Transfer $100 (Charlie → David)
-  T2: Transfer $200 (Alice → Bob)  ← THE $200 TRANSFER
-  T3: Transfer $50 (Eve → Frank)
-  BARRIER #5 arrives at t=3s
-```
+This IS about:
+- ✅ **ONE operator** (the JOIN operator)
+- ✅ It has **TWO inputs**
+- ✅ When should this ONE operator take its snapshot?
 
 ---
 
-**WITHOUT Blocking - Money Duplicates!**
+#### Ultra-Simple Example: The Core Problem
+
+**Setup**: ONE operator with TWO inputs
 
 ```
-t=1s: See BARRIER from Input 1
-      → Take snapshot immediately
-      → Snapshot: Alice=$1000, Bob=$500 (last from A2)
-      
-t=2s: Process A3 (Alice=$800, Bob=$700)
-      → Already past snapshot!
-      
-t=3s: See BARRIER from Input 2
-      → Input 2 snapshot includes up to T3
-      → But Input 1 already processed A3!
+Input 1 sends: Event A → Event B → BARRIER → Event C
+Input 2 sends: Event X → Event Y → Event Z → BARRIER
 ```
 
-**The Disaster**:
-1. Snapshot captured: Alice=$1000, Bob=$500
-2. But Input 2 hasn't seen Transfer T2 yet!
-3. **On restore**: Flink replays from snapshot
-   - Restores: Alice=$1000, Bob=$500
-   - Re-processes Transfer T2: Alice loses $200, Bob gains $200
-   - Result: Alice=$800, Bob=$700
-   - **BUT** Transfer T2 already happened once (Event A3 showed Alice=$800)!
-   - **Net effect**: Alice=$600, Bob=$900 (transfer happened TWICE!)
+**Timeline**:
 
-**Money created out of thin air!** This is data corruption.
+```
+t=1s: Input 1's BARRIER arrives at JOIN operator
+      JOIN has processed:
+        - Input 1: A, B (ready to snapshot)
+        - Input 2: X, Y (still processing, barrier not here yet!)
+        
+      Question: Should JOIN snapshot NOW?
+      
+      If YES (snapshot at t=1s):
+        Snapshot contains: Input 1 up to B, Input 2 up to Y
+        
+      But then...
+      
+t=2s: JOIN continues processing
+      Processes Event C from Input 1 (AFTER the barrier!)
+      Processes Event Z from Input 2 (BEFORE its barrier)
+      
+t=3s: Input 2's BARRIER finally arrives
+      JOIN tries to snapshot Input 2 now?
+      But Input 1 already processed C (which was AFTER its barrier)!
+```
+
+**The Problem**:
+- Snapshot includes: Input 1 up to B (BEFORE barrier), Input 2 up to Z (processed AFTER snapshot started)
+- This is a **MIXED state**: Part before barrier (Input 1) + part after starting snapshot (Input 2)
+- If Flink restores from this snapshot, Event C will be replayed!
 
 ---
 
-**WITH Blocking - Correct!**
+#### Now with Money: Why This Causes Duplication
+
+**Setup**: JOIN operator merging two streams
 
 ```
-t=1s: See BARRIER from Input 1
-      → BLOCK Input 1 (buffer A3, A4 in memory, DON'T process)
-      → Continue Input 2 (process T2, T3)
+Input 1 (Account Balances):
+  Event A: Alice=$1000
+  Event B: Alice=$1000 (status check)
+  BARRIER arrives at t=1s
+  Event C: Alice=$800  ← This shows $200 was deducted!
+  
+Input 2 (Transfer Commands):
+  Event X: Transfer $100 (Charlie → David)
+  Event Y: Transfer $50 (Eve → Frank)
+  Event Z: Transfer $200 (Alice → Bob)  ← THE ACTUAL TRANSFER
+  BARRIER arrives at t=3s
+```
+
+**WITHOUT Blocking**:
+
+```
+t=1s: BARRIER from Input 1 arrives
+      JOIN snapshots immediately:
+        - Input 1 state: Last processed = B (Alice=$1000)
+        - Input 2 state: Last processed = Y (hasn't seen Z yet)
       
-t=3s: See BARRIER from Input 2
-      → BOTH inputs at barrier point now
+      JOIN continues processing...
+      
+t=2s: JOIN processes Event C from Input 1
+      Alice=$800 (the $200 has been deducted!)
+      
+      BUT our snapshot says Alice=$1000!
+      AND our snapshot hasn't seen Event Z (the $200 transfer) yet!
+      
+t=3s: BARRIER from Input 2 arrives
+      Input 2 state now includes: X, Y, Z (the $200 transfer)
+```
+
+**On Crash and Restore**:
+1. Restore snapshot: Alice=$1000 (from Input 1 at time of snapshot)
+2. Replay Input 2 from snapshot point: Includes Event Z (Transfer $200)
+3. JOIN processes Event Z: Alice loses $200 → Alice=$800
+4. **BUT** Event C already showed Alice=$800 (the transfer already happened!)
+5. **Result**: Transfer happened TWICE! Alice goes to $600, Bob goes to $900
+
+**The money duplicated because**:
+- Snapshot captured Input 1 at "before transfer" state (Alice=$1000)
+- But Input 1 already processed Event C which showed "after transfer" (Alice=$800)
+- Snapshot captured Input 2 which includes Event Z (the transfer)
+- On restore: Transfer Z executes again!
+
+---
+
+#### WITH Blocking - Correct!
+
+```
+t=1s: BARRIER from Input 1 arrives
+      → BLOCK Input 1 (don't process Event C yet!)
+      → Buffer Event C in memory
+      → Continue processing Input 2
+      
+t=2s: Process Event Z from Input 2 (the $200 transfer)
+      
+t=3s: BARRIER from Input 2 arrives
+      → NOW both inputs at barrier point
       → Take snapshot:
-          Input 1: Last processed = A2 (Alice=$1000, Bob=$500)
-          Input 2: Last processed = T3 (includes T2)
+          Input 1: Last processed = B (Alice=$1000)
+          Input 2: Last processed = Z (includes transfer)
       → UNBLOCK Input 1
-      → Process buffered A3, A4
+      → Process buffered Event C (Alice=$800)
 ```
 
-**Why It Works**:
-1. Snapshot captured: Alice=$1000, Bob=$500 (before T2)
-2. Input 2 snapshot includes T2 (transfer queued)
-3. **On restore**: Flink replays from snapshot
-   - Restores: Alice=$1000, Bob=$500
-   - Processes Transfer T2 ONCE: Alice=$800, Bob=$700
-   - **Correct!**
+**On Crash and Restore**:
+1. Restore snapshot: Alice=$1000
+2. Replay Input 2: Includes Event Z (Transfer $200)
+3. Process Event Z ONCE: Alice=$800
+4. Event C will be replayed showing Alice=$800 (correct!)
+5. **Result**: Transfer happened ONCE! Alice=$800, Bob=$700 ✓
 
-**Snapshot is consistent** - both inputs at same logical time (before T2 processed).
+---
+
+#### Key Insight
+
+**The problem is**:
+- ONE operator (JOIN)
+- TWO inputs arriving at different times
+- If we snapshot when first input's barrier arrives, the second input isn't ready
+- Snapshot captures MIXED state: "before barrier" from Input 1 + "after snapshot started" from Input 2
+- On restore: Events get replayed incorrectly
+
+**The solution**:
+- BLOCK the fast input
+- Wait for slow input's barrier
+- Snapshot when BOTH at barrier point
+- Guarantees consistent state
 
 ---
 
