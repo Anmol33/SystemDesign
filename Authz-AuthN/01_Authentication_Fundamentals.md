@@ -99,7 +99,7 @@ graph LR
     Salt --> Algo
     Config --> Algo
     
-    Algo --> Hash["$argon2id$v=19$m=65536,t=3,p=4$salt$hash..."]
+    Algo --> Hash["Hash: argon2id v19 m65536 t3 p4"]
     
     style Hash fill:#ffcc00
 ```
