@@ -2607,7 +2607,7 @@ Checkpoint triggers:
 - Disable chaining for CPU-heavy operators to spread load
 - Configuration: `.disableChaining()` on heavy map/filter
 - **Trade-off**: More network overhead, better parallelism
-```
+
 
 ---
 
