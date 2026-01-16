@@ -1,39 +1,339 @@
 # 03. Token-Based Authentication
 
-## 1. Introduction
+## 1. Introduction: Stateful vs Stateless Authentication
 
-**Token-Based Authentication** is a **stateless** approach where the server issues a signed token (typically a **JWT** - JSON Web Token) to the client. The client stores this token (localStorage or memory) and sends it in the `Authorization` header for subsequent requests.
+### The Fundamental Problem
 
-**Key Characteristic**: **Stateless**. The server validates the token's signature mathematically. It does *not* need to check a database to know "who is this?". The token *is* the session.
+When you log in to a website, the server verifies your credentials (username + password). But HTTP is **stateless** - each request has no memory of previous requests. This creates a problem:
 
-**Why Use It**:
-- **Scalability**: No session store lookup required.
-- **Cross-Domain**: Works easily across different domains (CORS friendly).
-- **Mobile/API**: Standard for modern mobile apps and REST/GraphQL APIs.
+```
+Request 1: POST /login (username, password) → ✅ Valid
+Request 2: GET /profile                      → ❓ Who are you?
+Request 3: GET /settings                     → ❓ Who are you?
+```
+
+**The server needs a way to "remember" you across requests without asking for credentials every time.**
+
+---
+
+### Solution 1: Session-Based (Stateful)
+
+**Analogy:** Coat check at a restaurant
+
+When you arrive, you give your coat and get a ticket number. The restaurant keeps your coat and a record of ticket #123 = your coat. Every time you need something, you show ticket #123, and they check their records.
+
+**How it works:**
+
+```mermaid
+sequenceDiagram
+    participant Client as Client (Browser)
+    participant Server as Server
+    participant DB as Session Store<br/>(Database/Redis)
+    
+    Note over Client,Server: 1. Login (Authentication)
+    Client->>Server: POST /login<br/>username + password
+    Server->>DB: Verify credentials
+    DB-->>Server: User found ✓
+    
+    Server->>DB: Store session<br/>session_id=abc123<br/>user_id=alice<br/>role=admin
+    
+    Server-->>Client: Set-Cookie: session_id=abc123
+    
+    Note over Client,Server: 2. Subsequent Request
+    Client->>Server: GET /api/profile<br/>Cookie: session_id=abc123
+    
+    rect rgb(255, 230, 230)
+        Server->>DB: Query: "SELECT * FROM sessions<br/>WHERE id='abc123'"
+        DB-->>Server: user_id=alice, role=admin
+    end
+    
+    Server-->>Client: Profile data
+    
+    style DB fill:#ffcccc
+```
+
+**Key Point:** Server **stores session data** and **checks database every request**.
+
+**Characteristics:**
+- ✅ Easy to revoke (delete from database)
+- ✅ Server has full control
+- ❌ Database lookup every request (slow)
+- ❌ Requires shared session store across servers
+- ❌ Hard to scale horizontally
+
+---
+
+### Solution 2: Token-Based (Stateless)
+
+**Analogy:** Concert wristband
+
+When you enter the venue, you get a wristband with a special hologram. Staff don't check a database - they verify the hologram (which can't be faked). The wristband itself contains your tier (VIP/General), and staff trust it because of the hologram.
+
+**How it works:**
+
+```mermaid
+sequenceDiagram
+    participant Client as Client (Browser)
+    participant Server as Server
+    participant DB as Database
+    
+    Note over Client,Server: 1. Login (Authentication)
+    Client->>Server: POST /login<br/>username + password
+    Server->>DB: Verify credentials
+    DB-->>Server: User found ✓
+    
+    rect rgb(230, 255, 230)
+        Server->>Server: Create JWT<br/>{user_id: alice, role: admin}<br/>Sign with secret key
+    end
+    
+    Server-->>Client: JWT Token: eyJhbGc...
+    
+    Note over Client,Server: 2. Subsequent Request
+    Client->>Server: GET /api/profile<br/>Authorization: Bearer eyJhbGc...
+    
+    rect rgb(230, 255, 230)
+        Server->>Server: Verify signature (math)<br/>Check expiry<br/>Extract claims
+    end
+    
+    Note over Server: NO database lookup!
+    
+    Server-->>Client: Profile data
+    
+    style Server fill:#ccffcc
+```
+
+**Key Point:** Server **doesn't store anything**. Token validation is **pure mathematics** (signature verification).
+
+**Characteristics:**
+- ✅ No database lookup (fast, 0.1-0.5ms)
+- ✅ Easy to scale (no shared state)
+- ✅ Works across domains
+- ❌ Hard to revoke (token valid until expiry)
+- ❌ Token can be stolen and reused
+- ❌ Payload is visible (Base64, not encrypted)
+
+---
+
+### The Fundamental Difference
+
+**Session = Parking Ticket System**
+```
+You: "I'm ticket #123"
+Server: "Let me check... yes, you paid for VIP parking"
+         ↑
+    Database lookup every time
+```
+
+**Token = Wristband with Hologram**
+```
+You: "Here's my wristband (JWT)"
+Server: "Let me verify the hologram (signature)... valid! You're VIP"
+         ↑
+    Math verification, no database
+```
+
+| Aspect | Session (Stateful) | Token (Stateless) |
+|--------|-------------------|-------------------|
+| **Server Memory** | Stores session data | Stores nothing |
+| **Database** | Queried every request | Never queried |
+| **Validation** | "Is abc123 in database?" | "Is signature mathematically valid?" |
+| **Speed** | ~1-5ms (DB lookup) | ~0.1-0.5ms (CPU only) |
+| **Revocation** | Delete from DB (instant) | Wait for expiry (or blacklist) |
+| **Scalability** | Needs shared session store | No shared state needed |
+| **Cross-Domain** | Complex (CORS issues) | Easy (just HTTP header) |
+
+---
+
+### When to Use Tokens
+
+**✅ Use Token-Based (Stateless) when:**
+- Building microservices architecture
+- Need horizontal scalability
+- Mobile app authentication
+- Cross-domain APIs
+- Short-lived access (15 min)
+
+**❌ Avoid Token-Based when:**
+- Need instant revocation (security requirements)
+- Simple monolithic app (sessions simpler)
+- Long-lived sessions (tokens can't be revoked easily)
 
 ---
 
 ## 2. Core Architecture
 
+### The Three-Server Model
+
+Token-based authentication typically involves three components:
+
 ```mermaid
-graph TD
-    Client["Client (SPA/Mobile)"]
-    AuthServer["Auth Server"]
-    Resource["Resource Server (API)"]
+graph TB
+    subgraph "Client (Browser/Mobile)"
+        App["Application<br/><br/>Stores: JWT<br/>Sends: Authorization header"]
+    end
     
-    Client -->|"1. Login"| AuthServer
-    AuthServer -->|"2. Verify & Sign JWT (Private Key)"| AuthServer
-    AuthServer -->|"3. Return JWT"| Client
+    subgraph "Auth Server"
+        Login["Login Endpoint<br/>/auth/login"]
+        Refresh["Refresh Endpoint<br/>/auth/refresh"]
+        Secret["Secret Key<br/>(HMAC)<br/>or<br/>Private Key<br/>(RSA)"]
+        
+        Login --> Secret
+        Refresh --> Secret
+    end
     
-    Client -->|"4. Request + Header: Bearer <token>"| Resource
-    Resource -->|"5. Verify Signature (Public Key)"| Resource
-    Resource -->|"6. Data"| Client
+    subgraph "Resource Servers (APIs)"
+        API1["API Server 1<br/>/api/users"]
+        API2["API Server 2<br/>/api/orders"]
+        API3["API Server 3<br/>/api/payments"]
+        
+        Verify["Shared:<br/>Secret Key (HMAC)<br/>or<br/>Public Key (RSA)"]
+        
+        API1 --> Verify
+        API2 --> Verify
+        API3 --> Verify
+    end
+    
+    App -->|"1. Login credentials"| Login
+    Login -->|"2. JWT (15 min)"| App
+    
+    App -->|"3. API requests + JWT"| API1
+    App -->|"3. API requests + JWT"| API2
+    App -->|"3. API requests + JWT"| API3
+    
+    App -->|"4. Refresh token"| Refresh
+    Refresh -->|"5. New JWT"| App
+    
+    style Secret fill:#ffcccc
+    style Verify fill:#ccffcc
 ```
 
-### Components
-1.  **Access Token (JWT)**: Short-lived, contains claims (user_id, roles). Used to access resources.
-2.  **Refresh Token**: Long-lived, opaque string. Used to get new Access Tokens.
-3.  **Signing Key**: Secret (HMAC) or Private Key (RSA/ECDSA) used to sign tokens.
+### Components Explained
+
+#### 1. Access Token (JWT)
+
+**What it is:** Short-lived token containing user identity and permissions.
+
+**Structure:** `header.payload.signature` (we'll deep dive in next section)
+
+**Lifespan:** Typically 15 minutes
+
+**Contains:**
+```json
+{
+  "sub": "user123",      // User ID
+  "role": "admin",       // Permissions
+  "iat": 1516239022,     // Issued at (timestamp)
+  "exp": 1516239922      // Expires (15 min from iat)
+}
+```
+
+**Purpose:** Grants access to protected resources. Sent with every API request.
+
+**Security:** Short lifespan limits damage if stolen.
+
+#### 2. Refresh Token
+
+**What it is:** Long-lived, opaque token used to get new access tokens.
+
+**Structure:** Random string (not a JWT!) - e.g., `a8f5e2b9...` (128 random bytes)
+
+**Lifespan:** Typically 7 days to 30 days
+
+**Stored:** 
+- **Server**: In database (so it can be revoked!)
+- **Client**: HttpOnly cookie (JavaScript can't access)
+
+**Purpose:** When access token expires, client uses refresh token to get a new one without re-entering password.
+
+**Security:** Stateful (can be revoked immediately by deleting from database).
+
+#### 3. Signing Key
+
+**Two Approaches:**
+
+**Approach A: HMAC (HS256) - Symmetric**
+
+```
+Secret Key: "your-256-bit-secret"
+
+Auth Server uses it to:  SIGN tokens
+API Servers use it to:   VERIFY tokens
+
+Problem: All servers share the same secret!
+```
+
+**Approach B: RSA (RS256) - Asymmetric**
+
+```
+Private Key (on Auth Server only):  SIGN tokens
+Public Key (on all API servers):    VERIFY tokens
+
+Better: API servers can't create tokens, only verify!
+```
+
+---
+
+### The Complete Flow
+
+**Phase 1: Login (happens once)**
+
+```
+User → [username, password] → Auth Server
+                               ↓
+                        Check database
+                               ↓
+                        Create JWT (15 min)
+                        Create Refresh Token (7 days)
+                               ↓
+User ← [JWT, Refresh Token] ← Auth Server
+```
+
+**Phase 2: API Requests (happens many times)**
+
+```
+User → [JWT in header] → API Server
+                          ↓
+                   Verify signature (math only)
+                   Check expiry
+                   Extract user_id from payload
+                          ↓
+User ← [Data] ← API Server
+
+NO DATABASE LOOKUP!
+```
+
+**Phase 3: Token Refresh (happens when access token expires)**
+
+```
+User → [Refresh Token] → Auth Server
+                          ↓
+                   Check database (is refresh token valid?)
+                          ↓
+                   Create new JWT (15 min)
+                   Optionally: rotate refresh token
+                          ↓
+User ← [New JWT] ← Auth Server
+```
+
+---
+
+### Why This Architecture?
+
+**Separation of Concerns:**
+- **Auth Server**: Handles authentication, manages secrets
+- **Resource Servers**: Handle business logic, verify tokens
+- **Client**: Stores tokens, sends with requests
+
+**Scalability:**
+- Auth Server: Low traffic (only logins/refreshes)
+- Resource Servers: High traffic, but
+
+ stateless (no DB for token validation)
+
+**Security:**
+- Refresh tokens are stateful (can be revoked)
+- Access tokens are short-lived (limit damage if stolen)
+- Resource servers never see passwords
 
 ---
 
