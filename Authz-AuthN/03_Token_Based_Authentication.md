@@ -218,7 +218,7 @@ graph TB
     
     DecodeH --> CheckAlg{"Check<br/>algorithm"}
     
-    CheckAlg -->|"alg === 'HS256'| Compute["Compute signature:<br/>HMAC(header+'.'+payload, secret)"]
+    CheckAlg -->|"alg === 'HS256'"| Compute["Compute signature:<br/>HMAC(header.payload, secret)"]
     CheckAlg -->|"alg === 'none' or unknown"| Reject1["❌ REJECT"]
     
     Compute --> Compare{"Computed<br/>===<br/>Received?"}
