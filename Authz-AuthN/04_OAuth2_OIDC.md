@@ -257,35 +257,392 @@ User → [authorizes limited access] → Third-party app
 
 ---
 
-## 2. Core Architecture
+## 2. Core Architecture: The Four Roles
 
-The OAuth 2.0 ecosystem involves four primary roles.
+OAuth 2.0 defines four distinct roles in the authorization flow. Understanding these is critical to understanding how OAuth works.
+
+### The Four Roles Explained
 
 ```mermaid
-graph TD
-    RO["Resource Owner<br/>(User)"]
-    Client["Client App<br/>(Web/Mobile)"]
-    AuthServer["Authorization Server<br/>(IdP: Okta/Google)"]
-    RS["Resource Server<br/>(API: Gmail/Drive)"]
+graph TB
+    subgraph "1. Resource Owner (The User)"
+        RO["Alice<br/><br/>Owns: Facebook Photos<br/>Role: Authorize access"]
+    end
     
-    RO -->|"1. Grants Access"| Client
-    Client -->|"2. Requests Token"| AuthServer
-    AuthServer -->|"3. Issues Token"| Client
-    Client -->|"4. Access Data (w/ Token)"| RS
+    subgraph "2. Client (The App)"
+        Client["Photo Printing App<br/><br/>Wants: Alice's photos<br/>Role: Request access"]
+    end
     
-    style AuthServer fill:#e6ccff
+    subgraph "3. Authorization Server (The Gatekeeper)"
+        AS["Facebook OAuth Server<br/><br/>Does: Verify Alice<br/>Issues: Tokens"]
+    end
+    
+    subgraph "4. Resource Server (The API)"
+        RS["Facebook Photos API<br/><br/>Has: Alice's photos<br/>Protects: Data"]
+    end
+    
+    RO -->|"1. 'I authorize Photo App'"| AS
+    Client -->|"2. 'User authorized me'"| AS
+    AS -->|"3. 'Here's an access token'"| Client
+    Client -->|"4. 'GET /photos (token)'"| RS
+    RS -->|"5. 'Here are photos'"| Client
+    
+    style RO fill:#e6f3ff
+    style Client fill:#fff3e0
+    style AS fill:#e6ccff
+    style RS fill:#e6ffe6
 ```
 
-### Components
-1.  **Resource Owner**: The User who owns data.
-2.  **Client**: The application trying to access data.
-3.  **Authorization Server (AS)**: The system that issues tokens (e.g., Google, Auth0).
-4.  **Resource Server (RS)**: The API hosting the data.
+---
 
-### Artifacts (Tokens)
--   **Access Token**: Key to access the API (Opaque or JWT).
--   **Refresh Token**: Key to get new Access Tokens.
--   **ID Token (OIDC)**: Proof of user identity (JWT). **ONLY for the Client, NOT for the API.**
+### Role 1: Resource Owner (The User)
+
+**Who:** The person who owns the data (you, the Facebook user).
+
+**What they do:**
+- Own the resource (photos, emails, calendar)
+- Grant or deny access to third-party apps
+- Can revoke access anytime
+
+**Real example:**
+```
+Alice owns her Facebook photos.
+Photo Printing service asks for access.
+Alice clicks "Allow" → Resource Owner authorizing access.
+```
+
+**Key point:** The Resource Owner is the ONLY one who can grant permission. Not the app, not Facebook - only the user.
+
+---
+
+### Role 2: Client (The Third-Party Application)
+
+**Who:** The application requesting access to user data (Photo Printing App, Calendar Sync App, etc.).
+
+**Types of Clients:**
+
+**Confidential Clients:**
+- Can securely store secrets (server-side apps)
+- Examples: Traditional web apps with backend
+- Use: Authorization Code flow
+
+**Public Clients:**
+- Cannot securely store secrets (user devices)
+- Examples: Mobile apps, SPAs, desktop apps
+- Use: Authorization Code + PKCE flow
+
+**What they do:**
+- Request authorization from user
+- Exchange authorization code for tokens
+- Use access token to call APIs
+- Refresh tokens when they expire
+
+**Example:**
+```javascript
+// Client initiates OAuth flow
+const authUrl = `https://facebook.com/oauth/authorize?
+  client_id=photo-printing-app
+  &redirect_uri=https://photoprint.com/callback
+  &scope=read:photos
+  &response_type=code`
+
+// Redirect user to authUrl
+window.location = authUrl
+```
+
+---
+
+### Role 3: Authorization Server (The Identity Provider)
+
+**Who:** The service that authenticates users and issues tokens (Google, Facebook, Okta, Auth0).
+
+**What they do:**
+
+**1. Authenticate the Resource Owner**
+```
+User: "I want to authorize Photo App"
+Auth Server: "Prove it's you" (password/2FA/biometrics)
+User: [enters credentials]
+Auth Server: "Verified ✓"
+```
+
+**2. Show Consent Screen**
+```
+"Photo Printing App wants to:
+  ✅ View your photos
+  ❌ Delete photos
+  ❌ Access messages
+  
+[Allow] [Deny]"
+```
+
+**3. Issue Tokens**
+```
+If user clicks Allow:
+  → Authorization Code (short-lived, 60 seconds)
+  → Later: Access Token (1 hour)
+  → Later: Refresh Token (7 days)
+  → (OIDC) ID Token (identity proof)
+```
+
+**4. Validate Token Requests**
+- Verify client identity
+- Verify authorization code hasn't been used
+- Check redirect URI matches registered value
+- Generate and sign tokens
+
+**Example response:**
+```json
+{
+  "access_token": "ya29.a0AfH6SMB...",
+  "token_type": "Bearer",
+  "expires_in": 3600,
+  "refresh_token": "1//0gLN...",
+  "scope": "read:photos",
+  "id_token": "eyJhbGci..." // (OIDC only)
+}
+```
+
+---
+
+### Role 4: Resource Server (The Protected API)
+
+**Who:** The service hosting the actual data (Facebook Photos API, Gmail API, Google Drive API).
+
+**What they do:**
+
+**1. Validate Access Tokens**
+```javascript
+// Client sends request
+GET /api/photos
+Authorization: Bearer ya29.a0AfH6SMB...
+
+// Resource Server validates
+if (verifyToken(accessToken)) {
+  // Check token expiry
+  // Verify signature (if JWT)
+  // OR introspect with Auth Server
+  return photos
+} else {
+  return 401 Unauthorized
+}
+```
+
+**2. Check Scopes**
+```javascript
+const token = decodeToken(accessToken)
+
+if (token.scope.includes('read:photos')) {
+  return photos  // ✓ Allowed
+} else if (token.scope.includes('delete:photos')) {
+  deletePhotos()  // ✓ Allowed if scope granted
+} else {
+  return 403 Forbidden  // ✗ Missing scope
+}
+```
+
+**3. Enforce Rate Limits**
+```
+Client with token can make 1000 requests/hour
+Prevents abuse even with valid token
+```
+
+**Often the same as Auth Server:**
+In many cases (Google, Facebook), the Authorization Server and Resource Server are the same company:
+- Google OAuth Server (AS) + Gmail API (RS)
+- Facebook OAuth Server (AS) + Facebook Graph API (RS)
+
+But they can be separate:
+- Okta (AS) + Your Company API (RS)
+- Auth0 (AS) + Third-party APIs (RS)
+
+---
+
+### The Three Token Types
+
+OAuth 2.0 and OIDC use three different types of tokens, each with a specific purpose:
+
+#### 1. Authorization Code (Not really a "token")
+
+**What it is:** Temporary code representing user's consent.
+
+**Lifespan:** 60 seconds (very short!)
+
+**Format:** Random string (e.g., `SplxlOBeZQQYbYS6WxSbIA`)
+
+**Purpose:** Exchanged for access token in back-channel request.
+
+**Why it exists:** Separates user-facing redirect (front-channel) from secure token exchange (back-channel).
+
+```
+Front-channel (browser, public):
+  User → Auth Server → Browser redirected with CODE
+
+Back-channel (server-to-server, secure):
+  Client Server → POST /token with CODE + SECRET → Access Token
+```
+
+**Example:**
+```
+1. Browser redirected to:
+   https://photoapp.com/callback?code=SplxlOBeZQQYbYS6WxSbIA
+
+2. Server exchanges code for token:
+   POST /token
+   {
+     "code": "SplxlOBeZQQYbYS6WxSbIA",
+     "client_id": "photo-app",
+     "client_secret": "secret123",  // Only server knows this!
+     "grant_type": "authorization_code"
+   }
+```
+
+---
+
+#### 2. Access Token (The Key to the API)
+
+**What it is:** Credential to access protected resources.
+
+**Lifespan:** 1 hour (typical)
+
+**Format:** 
+- **Opaque:** Random string (e.g., `ya29.a0AfH6SMB...`) - needs introspection
+- **JWT:** Self-contained token with claims (most common with OIDC)
+
+**Contains (if JWT):**
+```json
+{
+  "iss": "https://accounts.google.com",
+  "aud": "photo-printing-app",
+  "sub": "user123",
+  "scope": "read:photos",
+  "exp": 1516243022,
+  "iat": 1516239422
+}
+```
+
+**Purpose:** Grant access to Resource Server APIs.
+
+**Usage:**
+```javascript
+// Client sends to Resource Server
+GET /api/photos
+Authorization: Bearer ya29.a0AfH6SMB...
+```
+
+**Security:**
+- Short-lived (limits damage if stolen)
+- Scope-limited (only permissions user granted)
+- Bearer token (whoever has it can use it - no binding)
+
+---
+
+#### 3. Refresh Token (The Key to New Access Tokens)
+
+**What it is:** Long-lived credential to get new access tokens.
+
+**Lifespan:** 7-90 days (configurable)
+
+**Format:** Opaque string (e.g., `1//0gLN8e3BHs...`)
+
+**Purpose:** Get new access tokens without user re-authentication.
+
+**Why it exists:**
+- Access tokens are short-lived (1 hour)
+- User shouldn't re-login every hour
+- Refresh token lets client get new access token silently
+
+**Usage:**
+```javascript
+// When access token expires (401)
+POST /token
+{
+  "grant_type": "refresh_token",
+  "refresh_token": "1//0gLN8e3BHs...",
+  "client_id": "photo-app",
+  "client_secret": "secret123"
+}
+
+// Response
+{
+  "access_token": "new_access_token",
+  "expires_in": 3600,
+  "refresh_token": "new_refresh_token"  // Token rotation
+}
+```
+
+**Security:**
+- **Stored securely** (HttpOnly cookie or encrypted storage)
+- **Can be revoked** (user logs out → delete refresh token from DB)
+- **Rotation** (issue new refresh token with each use, revoke old one)
+
+---
+
+#### 4. ID Token (OIDC Only - Proof of Identity)
+
+**What it is:** JWT containing user identity information.
+
+**Lifespan:** Same as access token (typically 1 hour)
+
+**Format:** Always JWT (never opaque)
+
+**Contains:**
+```json
+{
+  "iss": "https://accounts.google.com",
+  "sub": "user123",
+  "aud": "photo-printing-app",
+  "exp": 1516243022,
+  "iat": 1516239422,
+  "email": "alice@gmail.com",
+  "email_verified": true,
+  "name": "Alice Smith",
+  "picture": "https://..."
+}
+```
+
+**Purpose:** 
+- **NOT for API access** (that's Access Token's job)
+- **ONLY for Client** to learn user's identity
+- Client validates signature and trusts claims
+
+**Usage:**
+```javascript
+// Client receives ID token
+const idToken = response.id_token
+
+// Verifies signature
+const claims = jwt.verify(idToken, googlePublicKey)
+
+// Creates local session
+createSession({
+  userId: claims.sub,
+  email: claims.email,
+  name: claims.name
+})
+
+// "Welcome, Alice!"
+```
+
+**Critical distinction:**
+```
+Access Token → Give to Resource Server → API access
+ID Token → Keep on Client → Know who user is
+```
+
+---
+
+### Token Comparison Table
+
+| Property | Authorization Code | Access Token | Refresh Token | ID Token (OIDC) |
+|----------|-------------------|--------------|---------------|-----------------|
+| **Lifespan** | 60 seconds | 1 hour | 7-90 days | 1 hour |
+| **Format** | Random string | JWT or Opaque | Opaque | Always JWT |
+| **Purpose** | Exchange for tokens | Access APIs | Get new access tokens | User identity |
+| **Sent to** | Client (via redirect) | Resource Server | Auth Server | Client only |
+| **Renewable** | No (use once) | Yes (via refresh) | Sometimes (rotation) | No (get new via refresh) |
+| **Revocable** | N/A (expires fast) | Hard (wait for expiry) | Yes (delete from DB) | N/A |
+| **Validated by** | Auth Server | Resource Server | Auth Server | Client |
 
 ---
 
