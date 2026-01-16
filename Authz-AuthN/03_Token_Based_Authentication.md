@@ -48,8 +48,6 @@ sequenceDiagram
     end
     
     Server-->>Client: Profile data
-    
-    style DB fill:#ffcccc
 ```
 
 **Key Point:** Server **stores session data** and **checks database every request**.
@@ -98,8 +96,6 @@ sequenceDiagram
     Note over Server: NO database lookup!
     
     Server-->>Client: Profile data
-    
-    style Server fill:#ccffcc
 ```
 
 **Key Point:** Server **doesn't store anything**. Token validation is **pure mathematics** (signature verification).
