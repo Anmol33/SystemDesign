@@ -46,6 +46,151 @@ Within Spark Memory:
   - Storage: 2.91GB (initial)
 - User Memory: 3.88GB
 
+---
+
+### Understanding User Memory
+
+**User Memory** is often overlooked but critical—it's the portion of heap that **Spark does NOT manage**. With the default `spark.memory.fraction = 0.6`, 40% of usable memory is reserved for user code.
+
+#### What Lives in User Memory?
+
+**1. User Data Structures**
+
+Objects your code creates outside RDD operations:
+```scala
+// These live in User Memory, NOT Spark Memory
+val myLookup = new HashMap[String, Int]()
+myLookup.put("key1", 100)
+
+val config = new MyAppConfig()
+val cache = new LRUCache[String, Data]()
+```
+
+**2. User-Defined Objects in Closures**
+
+Variables captured by your transformations:
+```scala
+val processor = new DataProcessor()  // User Memory
+
+rdd.map { record =>
+  processor.transform(record)  // processor lives in User Memory
+}
+```
+
+**3. Spark Internal Metadata**
+
+- RDD lineage DAGs
+- Task metadata and tracking
+- Broadcast variable metadata (not the broadcasted data itself)
+- Accumulator state
+- SparkContext internal structures
+
+**4. Third-Party Library Objects**
+
+Any external libraries you use:
+```scala
+import org.apache.commons.lang3.StringUtils
+import com.google.gson.Gson
+
+val gson = new Gson()  // User Memory
+```
+
+**5. Temporary Objects in User Code**
+
+```scala
+rdd.map { line =>
+  val parts = line.split(",")           // Temporary array: User Memory
+  val obj = new MyRecord(parts)         // Temporary object: User Memory  
+  val processed = obj.transform()       // Another temp: User Memory
+  processed
+}
+```
+
+#### Visual Breakdown
+
+```mermaid
+graph TB
+    subgraph "10GB Executor Heap"
+        Reserved["Reserved: 300MB<br/>(Spark Internals)"]
+        
+        subgraph "9.7GB Usable Memory"
+            subgraph "Spark Memory: 5.82GB (60%)"
+                Exec["Execution: 2.91GB<br/>Tasks, Shuffles, Joins"]
+                Stor["Storage: 2.91GB<br/>Cached RDDs, Broadcasts"]
+            end
+            
+            subgraph "User Memory: 3.88GB (40%)"
+                UD["Your HashMaps,<br/>ArrayLists, Objects"]
+                Closure["Closure-Captured<br/>Variables"]
+                Libs["Third-Party<br/>Library Objects"]
+                Meta["Spark Internal<br/>Metadata"]
+            end
+        end
+    end
+    
+    style Reserved fill:#e0e0e0
+    style Exec fill:#fff3e0
+    style Stor fill:#e1f5fe
+    style UD fill:#ffe0f0
+    style Closure fill:#ffe0f0
+    style Libs fill:#ffe0f0
+    style Meta fill:#ffe0f0
+```
+
+#### When User Memory Matters
+
+**❌ You'll get OutOfMemoryError if User Memory is too small:**
+
+```
+java.lang.OutOfMemoryError: Java heap space
+  at java.util.HashMap.resize()
+  at your.code.YourClass.processData()
+```
+
+This error comes from **your code**, not Spark operations. Spark Memory is fine, but User Memory is exhausted.
+
+**Common Scenarios:**
+
+| Scenario | User Memory Usage | Recommendation |
+|----------|------------------|----------------|
+| **Heavy user data structures** | High (large HashMaps, caches) | Increase: `spark.memory.fraction = 0.5` |
+| **Minimal user objects** | Low (simple transformations) | Decrease: `spark.memory.fraction = 0.7` |
+| **Third-party libraries** | Medium-High (JSON parsers, ML libs) | Keep default or increase |
+| **Pure Spark operations** | Low (just RDD, shuffle, cache) | Decrease to give Spark more |
+
+#### Configuration Strategy
+
+**Increase User Memory** (decrease `spark.memory.fraction`):
+```scala
+spark.memory.fraction = 0.5  // 50% Spark, 50% User
+```
+
+✅ Use when:
+- Large HashMap/ArrayList in user code
+- Heavy third-party libraries (Jackson, Gson, ML models)
+- Complex object creation in transformations
+- Getting OOM in user code
+
+**Decrease User Memory** (increase `spark.memory.fraction`):
+```scala
+spark.memory.fraction = 0.75  // 75% Spark, 25% User
+```
+
+✅ Use when:
+- Simple transformations (just map/filter)
+- Heavy caching/shuffle workload
+- Minimal user-created objects
+- Spark operations need more memory
+
+#### Common Misconception
+
+**Wrong**: "Spark manages all executor memory"  
+**Right**: "Spark only manages Execution + Storage pools. User Memory is for YOUR code."
+
+The `spark.memory.fraction` parameter answers: **"What fraction should Spark control vs. what you control?"**
+
+---
+
 ### The Dynamic Boundary
 
 Unlike older static splits, the Unified Memory Manager allows the boundary between Execution and Storage to shift:
