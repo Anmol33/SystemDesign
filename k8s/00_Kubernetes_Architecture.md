@@ -57,62 +57,6 @@ Before diving into the details, let's visualize how all the pieces fit together:
 
 Now let's break down each component:
 
-```mermaid
-graph TB
-    subgraph ControlPlane["Control Plane (Master Nodes)"]
-        API["kube-apiserver<br/>(API Gateway)"]
-        ETCD["etcd Cluster<br/>(State Store)"]
-        Sched["kube-scheduler<br/>(Pod Placement)"]
-        CM["kube-controller-manager<br/>(Reconciliation Loops)"]
-        CCM["cloud-controller-manager<br/>(Cloud Integration)"]
-    end
-    
-    subgraph WorkerNode1["Worker Node 1"]
-        Kubelet1["kubelet<br/>(Node Agent)"]
-        KProxy1["kube-proxy<br/>(Network Rules)"]
-        Runtime1["Container Runtime<br/>(containerd/CRI-O)"]
-        Pod1A["Pod: web-1"]
-        Pod1B["Pod: api-2"]
-    end
-    
-    subgraph WorkerNode2["Worker Node 2"]
-        Kubelet2["kubelet"]
-        KProxy2["kube-proxy"]
-        Runtime2["Container Runtime"]
-        Pod2A["Pod: db-1"]
-        Pod2B["Pod: cache-1"]
-    end
-    
-    User["kubectl<br/>(User CLI)"]
-    
-    User -->|"POST /api/v1/pods"| API
-    API <--> ETCD
-    API --> Sched
-    API --> CM
-    API --> CCM
-    
-    Sched -.Watches Unscheduled Pods.-> API
-    CM -.Watches Resources.-> API
-    
-    Kubelet1 -.Watches Assigned Pods.-> API
-    Kubelet2 -.Watches Assigned Pods.-> API
-    
-    Kubelet1 --> Runtime1
-    Runtime1 --> Pod1A
-    Runtime1 --> Pod1B
-    
-    Kubelet2 --> Runtime2
-    Runtime2 --> Pod2A
-    Runtime2 --> Pod2B
-    
-    KProxy1 -.Programs Network Rules.-> Pod1A
-    KProxy2 -.Programs Network Rules.-> Pod2A
-    
-    style API fill:#e6f3ff
-    style ETCD fill:#ffe6e6
-    style Sched fill:#e6ffe6
-    style CM fill:#fff9e6
-```
 
 ### Key Components
 
@@ -137,14 +81,18 @@ graph TB
 8. **Container Runtime**: Actually runs containers (containerd, CRI-O). Kubernetes talks to runtime via CRI (Container Runtime Interface).
 
 **Control Plane vs Data Plane**:
-- **Control Plane**: Decision-making components (API, scheduler, controllers) - typically 3-5 replicated nodes
-- **Data Plane**: Execution layer (worker nodes running actual application Pods) - scales from 1 to 10,000+ nodes
+- **Control Plane**: Decision-making layer (API, scheduler, controllers) - typically 3-5 replicated nodes for high availability
+- **Data Plane**: Execution layer (worker nodes running Pods) - scales from 1 to 10,000+ nodes
+
+**Key Takeaway**: The control plane is the "brain" that makes decisions, worker nodes are the "muscles" that execute work. All communication flows through the API server, which is the only component allowed to talk to etcd.
 
 ---
 
 ## How Kubernetes Actually Works: From YAML to Running Containers
 
-### A. Declarative Configuration (The Core Philosophy)
+### A. Declarative Configuration: Tell Kubernetes WHAT, Not HOW
+
+**This is the foundational concept that makes Kubernetes powerful.**
 
 **Imperative (Docker) approach**:
 ```bash
@@ -212,7 +160,7 @@ graph TB
     Container1 <-."localhost:9000".-> Container2
 ```
 
-**Pod Characteristics**:
+**Key Pod Characteristics** (what makes Pods special):
 
 1. **Shared Network**: All containers in a Pod share the same IP address. Container 1 can reach Container 2 via `localhost:9000`.
 
@@ -249,7 +197,7 @@ spec:
     # Pod definition
 ```
 
-**Controller Loop** (runs every 10 seconds):
+**The Reconciliation Loop** (continuously running):
 
 ```
 while true:
@@ -301,7 +249,7 @@ Time 65s: Controller sees 5 Pods, does nothing ✓
           Frontend still trying to connect to 10.244.1.5 → FAILS
 ```
 
-**Solution**: Service = stable virtual IP (VIP) that load balances across Pods
+**The Solution**: A **Service** provides a stable virtual IP (VIP) that automatically load balances traffic across all matching Pods—even as Pods die and restart with new IPs
 
 ```yaml
 apiVersion: v1
@@ -373,7 +321,7 @@ sequenceDiagram
 
 **Three-Phase Process**:
 
-#### Phase 1: Filtering (Feasibility)
+#### Phase 1: Filtering (Eliminating Impossible Nodes)
 
 Eliminate nodes that cannot run the Pod:
 
@@ -401,7 +349,7 @@ Filtering:
 5. **MatchNodeSelector**: Node labels match Pod's `nodeSelector`
 6. **PodToleratesNodeTaints**: Pod tolerates node taints (e.g., node=gpu)
 
-#### Phase 2: Scoring (Optimization)
+#### Phase 2: Scoring (Finding the Best Match)
 
 Rank remaining nodes (0-100 points):
 
@@ -425,7 +373,7 @@ Final Scores:
   Node-6: (25 + 40 + 100) / 3 = 55
 ```
 
-#### Phase 3: Binding
+#### Phase 3: Binding (Making It Official)
 
 ```
 1. Scheduler picks Node-5 (highest score)
@@ -552,7 +500,9 @@ Pod-1 can directly connect to 10.244.2.8 (no port mapping!)
 
 **What is CNI (Container Network Interface)?**
 
-**The Problem**: Kubernetes needs networking, but doesn't want to be locked into one implementation.
+**The Problem Kubernetes Solved**: How do you provide networking flexibility without being locked into a single implementation?
+
+**The Answer**: Define a standard interface (CNI) that any network plugin can implement—just like USB works with any device.
 
 **Analogy**: CNI is like a **power outlet standard** (US, EU, UK plugs).
 
@@ -732,19 +682,8 @@ Database is empty (all data gone!)
 
 **Solution**: PersistentVolume (PV) + PersistentVolumeClaim (PVC)
 
-**Three-Layer Abstraction**:
+**The Three-Layer Abstraction** (separating 'what you need' from 'how it's provided'):
 
-```mermaid
-graph TB
-    Pod["Pod: postgres<br/>(Consumes Storage)"]
-    PVC["PersistentVolumeClaim<br/>Request: 10GB SSD<br/>(Abstract Interface)"]
-    PV["PersistentVolume<br/>AWS EBS vol-abc123<br/>(Actual Disk)"]
-    EBS["AWS EBS Volume<br/>vol-abc123<br/>(Cloud Storage)"]
-    
-    Pod -->|"mounts"| PVC
-    PVC -->|"bound to"| PV
-    PV -->|"backed by"| EBS
-```
 
 **Step-by-Step**:
 
