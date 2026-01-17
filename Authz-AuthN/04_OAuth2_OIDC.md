@@ -773,6 +773,163 @@ ID Token → Keep on Client → Know who user is
 
 ---
 
+### When to Store Tokens: Two Distinct Scenarios
+
+**This is a critical distinction that causes confusion!**
+
+#### Scenario 1: Login ONLY (Authentication)
+
+**Example:** User wants to "Login with Google" to PhotoApp.
+
+**What PhotoApp wants:** Just know WHO the user is (email, name, picture).
+
+**What PhotoApp gets from Google:**
+```json
+{
+  "id_token": "eyJhbG...",      // User identity (email, name)
+  "access_token": "ya29...",    // For Google API access
+  "re fresh_token": "1//0gLN..."  // To get new access tokens
+}
+```
+
+**What PhotoApp stores:**
+```javascript
+// ONLY stores user info from ID Token
+await db.users.create({
+  googleId: claims.sub,
+  email: claims.email,      // From ID Token
+  name: claims.name,        // From ID Token
+  picture: claims.picture   // From ID Token
+})
+
+// Does NOT store:
+// ❌ Access token (not calling Google APIs)
+// ❌ Refresh token (no point without access token!)
+```
+
+**Why not store tokens?**
+- Access token is ONLY for calling Google APIs (Gmail, Calendar, Drive)
+- PhotoApp is NOT calling Google APIs
+- Refresh token is ONLY for getting NEW access tokens
+- If you're not using access tokens, refresh token is useless!
+
+---
+
+#### Scenario 2: Login + API Access (Authentication + Authorization)
+
+**Example:** PhotoApp wants to sync user's Google Calendar.
+
+**What PhotoApp wants:** Know who user is AND access their Google Calendar.
+
+**What PhotoApp gets from Google:**
+```json
+{
+  "id_token": "eyJhbG...",
+  "access_token": "ya29...",     // ← Need this for API calls!
+  "refresh_token": "1//0gLN...", // ← Need this to get new access tokens!
+  "scope": "openid email profile calendar"
+}
+```
+
+**What PhotoApp stores:**
+```javascript
+// Store user info
+await db.users.create({
+  googleId: claims.sub,
+  email: claims.email,
+  name: claims.name
+})
+
+// ALSO store tokens for API access
+await db.userTokens.create({
+  userId: user.id,
+  provider: 'google',
+  accessToken: encrypt(response.access_token),    // ← For immediate API calls
+  refreshToken: encrypt(response.refresh_token),  // ← To get new access tokens
+  scope: response.scope,
+  expiresAt: Date.now() + 3600000  // Access token expires in 1 hour
+})
+```
+
+**Why store both tokens?**
+```javascript
+// 30 minutes later: Sync calendar (access token still valid)
+const tokens = await db.userTokens.findOne({ userId: user.id })
+const events = await fetch('https://www.googleapis.com/calendar/v3/calendars/primary/events', {
+  headers: { 'Authorization': `Bearer ${decrypt(tokens.accessToken)}` }
+})
+
+// 2 hours later: Access token expired!
+// Use refresh token to get new access token
+if (tokens.expiresAt < Date.now()) {
+  const newTokens = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    body: {
+      grant_type: 'refresh_token',
+      refresh_token: decrypt(tokens.refreshToken),
+      client_id: process.env.GOOGLE_CLIENT_ID,
+      client_secret: process.env.GOOGLE_CLIENT_SECRET
+    }
+  })
+  
+  // Update stored access token
+  await db.userTokens.update(user.id, {
+    accessToken: encrypt(newTokens.access_token),
+    expiresAt: Date.now() + 3600000
+  })
+  
+  // Continue syncing calendar without user re-login!
+}
+```
+
+---
+
+### Quick Decision Tree
+
+```
+Do you need to call Google APIs?
+│
+├─ NO (just login)
+│   └─ Store: User info only
+│   └─ Don't store: Access token, Refresh token
+│   └─ Example: "Sign in with Google"
+│
+└─ YES (need API access)
+    └─ Store: User info + Access token + Refresh token
+    └─ Use: Access token for API calls (1 hour)
+    └─ Use: Refresh token when access token expires (30 days)
+    └─ Example: "Sync Google Calendar", "Import Gmail contacts"
+```
+
+---
+
+### The Relationship: Access Token ← Refresh Token
+
+```
+Access Token (short-term):
+  Lifespan: 1 hour
+  Purpose: Make API calls to Google
+  Problem: Expires quickly
+  
+Refresh Token (long-term):
+  Lifespan: 30 days
+  Purpose: Get NEW access tokens
+  Solution: Renew access without user login
+  
+Workflow:
+  Hour 1: Use access token → Works ✓
+  Hour 2: Access token expired → Use refresh token → Get new access token ✓
+  Hour 3: Use new access token → Works ✓
+  Day 30: Refresh token expired → User must re-login
+```
+
+**Bottom Line:**
+- **Login only?** Store nothing (just user info from ID Token)
+- **Login + API access?** Store BOTH access token AND refresh token
+- Refresh token without access token = Pointless!
+
+---
+
 ## 3. How It Works: The Standards Flows
 
 Different clients need different flows.
