@@ -309,6 +309,284 @@ sequenceDiagram
 
 ---
 
+#### Wait, What IS a Kubernetes Service? (It's Not a Pod!)
+
+**This is confusing for beginners, so let's clarify:**
+
+![Kubernetes Service Explained](./images/k8s_service_explained.png)
+
+**Critical Understanding**:
+
+**❌ Service is NOT**:
+- NOT a Pod running somewhere
+- NOT a container
+- NOT a process you can SSH into
+
+**✅ Service IS**:
+- A **virtual IP address** (ClusterIP like `10.96.0.10`)
+- Just **metadata stored in etcd** (configuration only)
+- A **set of iptables rules** programmed on every node
+
+**The diagram shows three key points:**
+
+1. **What is it?**: Virtual IP stored as configuration in etcd
+2. **Where does it run?**: Doesn't "run" anywhere! kube-proxy reads the Service definition and programs iptables rules
+3. **How it works?**: iptables rules intercept packets and transform them
+
+**Analogy**: A Service is like a **phone switchboard operator** from the 1950s:
+- You call one number (Service VIP)
+- Operator patches your call through to an available person (Pod)
+- People (Pods) can change shifts, operator number stays the same
+
+---
+
+#### What is iptables? (The Magic Behind Services)
+
+![iptables Packet Filtering Explained](./images/k8s_iptables_explained.png)
+
+**iptables Definition**: A Linux **firewall/packet filter** built into the kernel that can intercept and modify **EVERY network packet**.
+
+**Think of it as airport security for packets:**
+- Every packet must pass through security checkpoints
+- Security checks rules: "Is this packet allowed?", "Should I redirect it?"
+- Can modify, redirect, or block packets
+
+**Three iptables Tables** (rule categories):
+
+**1. Filter Table**: Allow or block packets
+```bash
+# Example: Block all traffic from IP 1.2.3.4
+-A INPUT -s 1.2.3.4 -j DROP
+```
+
+**2. NAT Table** (← Kubernetes uses THIS!):
+```bash
+# Example: Change destination from Service IP to Pod IP
+-A PREROUTING -d 10.96.0.10 -j DNAT --to-destination 10.244.1.5:8080
+```
+
+**3. Mangle Table**: Modify packet headers (advanced)
+
+**Where iptables intercepts packets** (packet journey through kernel):
+
+```
+Application sends packet
+     ↓
+[PREROUTING] ← iptables intercepts HERE (NAT happens)
+     ↓
+Routing decision (where should packet go?)
+     ↓
+[FORWARD] ← For packets being forwarded
+     ↓
+[POSTROUTING] ← Source NAT happens here
+     ↓
+Packet leaves to network
+```
+
+**How kube-proxy uses iptables**:
+
+```bash
+# When you create a Service, kube-proxy does this:
+
+# 1. Create chain for Service
+iptables -t nat -N KUBE-SVC-WEB  # "WEB" service chain
+
+# 2. Add rule to jump to Service chain
+iptables -t nat -A PREROUTING \
+  -d 10.96.0.10 -p tcp --dport 80 \
+  -j KUBE-SVC-WEB
+
+# 3. Create chains for each Pod (Service Endpoints)
+iptables -t nat -N KUBE-SEP-POD1  # Pod 1
+iptables -t nat -N KUBE-SEP-POD2  # Pod 2  
+iptables -t nat -N KUBE-SEP-POD3  # Pod 3
+
+# 4. Load balance: Randomly pick one Pod
+iptables -t nat -A KUBE-SVC-WEB \
+  -m statistic --mode random --probability 0.33 \
+  -j KUBE-SEP-POD1
+
+iptables -t nat -A KUBE-SVC-WEB \
+  -m statistic --mode random --probability 0.50 \
+  -j KUBE-SEP-POD2
+
+iptables -t nat -A KUBE-SVC-WEB \
+  -j KUBE-SEP-POD3
+
+# 5. Each Pod chain does DNAT (change destination to Pod IP)
+iptables -t nat -A KUBE-SEP-POD1 \
+  -j DNAT --to-destination 10.244.1.5:8080
+```
+
+**View actual rules**:
+```bash
+$ iptables -t nat -L -n | grep KUBE
+# You'll see hundreds of rules created by kube-proxy!
+```
+
+**Key Insight**: kube-proxy doesn't forward packets itself. It just **programs iptables rules**, then the **kernel** does the actual packet forwarding.
+
+---
+
+#### The Complete Packet Journey: From Service VIP to Pod
+
+![Service Packet Transformation](./images/k8s_service_packet_flow.png)
+
+**Let's trace a real packet** through the entire flow:
+
+**Scenario**: Frontend Pod calls `web-service:80`
+
+**STEP 1: Client sends packet**
+
+```
+Source IP:        10.244.1.3 (frontend Pod)
+Source Port:      54321 (random client port)
+↓
+Destination IP:   10.96.0.10 (Service VIP)
+Destination Port: 80
+```
+
+**STEP 2: Kernel intercepts in PREROUTING chain**
+
+```
+Linux kernel network stack:
+  "Packet destined for 10.96.0.10:80"
+  → Check iptables NAT table PREROUTING rules
+```
+
+**STEP 3: iptables rule matches**
+
+```bash
+# Rule matches!
+-A KUBE-SERVICES -d 10.96.0.10/32 -p tcp -m tcp --dport 80 \
+  -j KUBE-SVC-XXX
+
+# Jump to Service chain, randomly select Pod
+-A KUBE-SVC-XXX -m statistic --mode random --probability 0.33 \
+  -j KUBE-SEP-POD1
+
+# Let's say Pod 1 selected
+```
+
+**STEP 4: DNAT transformation** (Destination NAT)
+
+```
+BEFORE (original packet):
+  Source:      10.244.1.3:54321 (frontend)
+  Destination: 10.96.0.10:80    (Service VIP)
+
+iptables rule: -j DNAT --to-destination 10.244.1.5:8080
+
+AFTER (transformed packet):
+  Source:      10.244.1.3:54321 (UNCHANGED)
+  Destination: 10.244.1.5:8080  (CHANGED to Pod IP!)
+```
+
+**STEP 5: Packet routed to Pod**
+
+```
+Kernel routing:
+  Destination 10.244.1.5 → Route to docker0 bridge → Pod receives packet
+
+Pod application:
+  Sees connection from 10.244.1.3:54321 ← Thinks client connected directly!
+```
+
+**STEP 6: Response path (reverse transformation)**
+
+```
+Pod sends response:
+  Source:      10.244.1.5:8080  (Pod IP)
+  Destination: 10.244.1.3:54321 (frontend)
+
+iptables connection tracking (conntrack) remembers the original request:
+  "This is a response to a packet we modified"
+  → Reverse the DNAT
+
+SNAT (Source NAT) transformation:
+  Source:      10.96.0.10:80     (CHANGED back to Service VIP!)
+  Destination: 10.244.1.3:54321  (UNCHANGED)
+
+Frontend receives response:
+  Thinks it came from Service 10.96.0.10 ← Completely transparent!
+```
+
+**Why SNAT is crucial**:
+
+Without SNAT:
+```
+Frontend calls: web-service (10.96.0.10)
+Response from:  10.244.1.5 (Pod IP)  ← Different IP!
+Frontend: "Wait, I didn't connect to .1.5, I connected to .0.10!"
+         → Connection rejected
+```
+
+With SNAT:
+```
+Frontend calls: web-service (10.96.0.10)
+Response from:  web-service (10.96.0.10)  ← Same IP
+Frontend: "Perfect! Response from who I called"
+         → Connection succeeds ✓
+```
+
+**Connection Tracking** (how kernel remembers):
+
+```bash
+$ conntrack -L | grep 10.96.0.10
+tcp  120 ESTABLISHED src=10.244.1.3 dst=10.96.0.10 \
+                     src=10.244.1.5 dst=10.244.1.3 [ASSURED]
+# Kernel maintains state table of active connections
+```
+
+**The Magic**: From the frontend's perspective:
+- Connected to Service `10.96.0.10:80`
+- Response came from Service `10.96.0.10:80`
+- **Never knew** actual Pod `10.244.1.5` handled it
+
+**Even if Pod 1 dies**, next request goes to Pod 2 or 3 automatically. Frontend never notices!
+
+---
+
+#### Why This Design? (iptables vs Other Approaches)
+
+**Alternative: kube-proxy as actual proxy** (old way before iptables mode):
+
+```
+Client → kube-proxy process → Pod
+   ↓ Problem: kube-proxy is bottleneck, single point of failure
+```
+
+**Current: iptables mode**:
+```
+Client → kernel iptables → Pod
+   ✓ No userspace proxy (pure kernel, fast!)
+   ✓ No single point of failure
+   ✓ Scales to thousands of Services
+```
+
+**Modern alternatives**:
+- **IPVS mode**: Better load balancing algorithms, more efficient for many Services
+- **eBPF (Cilium)**: Even faster, observability built-in
+
+---
+
+### Summary: Service Networking
+
+**What happens when you create a Service**:
+
+1. **API server** creates Service object in etcd (virtual IP allocated)
+2. **CoreDNS** registers DNS name → Service IP
+3. **kube-proxy** on EVERY node watches Service + Endpoints
+4. **kube-proxy** programs **iptables rules** on EVERY node
+5. **Client** sends to Service VIP
+6. **Kernel iptables** intercepts packet, applies DNAT to random Pod IP
+7. **Pod** responds, kernel applies reverse SNAT
+8. **Client** sees response from Service VIP (stable, consistent)
+
+**No Service "Pod" running anywhere** - it's ALL iptables rules + kernel magic!
+
+---
+
 ## Deep Dive: How Kubernetes Really Works Under the Hood
 
 ### The Kubernetes Scheduler: Finding the Perfect Home for Your Pod
