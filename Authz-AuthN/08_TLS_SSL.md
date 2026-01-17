@@ -90,6 +90,10 @@ This is where certificates come in. **Anyone** can encrypt data. The real questi
 
 ### The Chain of Trust
 
+Your browser trusts google.com through a chain of digital signatures:
+
+![Certificate Chain of Trust](./images/certificate_chain_visual.png)
+
 ```mermaid
 graph TB
     Browser["Browser Trust Store<br/>(Pre-installed Root CAs)"]
@@ -194,6 +198,8 @@ sequenceDiagram
 **Symptom**: Page loads over HTTPS but resources blocked, insecure icon shown.
 **Cause**: HTTPS page loading HTTP resources (images, scripts, CSS).
 **Mechanism**: Browser blocks insecure content to prevent downgrade attacks.
+
+![Mixed Content Warning](./images/mixed_content_warning.png)
 
 ```mermaid
 sequenceDiagram
