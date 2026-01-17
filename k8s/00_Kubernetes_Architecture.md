@@ -45,7 +45,17 @@ Kubernetes is a **container orchestration platform** that automates deployment, 
 
 ---
 
-## 2. Core Architecture
+## The Kubernetes Control Plane: Meet the Orchestra Conductor
+
+Before diving into the details, let's visualize how all the pieces fit together:
+
+![Kubernetes Control Plane Architecture](./images/k8s_control_plane_architecture.png)
+
+**The architecture above shows two critical layers:**
+- **Control Plane (Master Nodes)**: The brain that makes decisions
+- **Worker Nodes**: The muscles that execute work
+
+Now let's break down each component:
 
 ```mermaid
 graph TB
@@ -132,7 +142,7 @@ graph TB
 
 ---
 
-## 3. How It Works: Basic Mechanics
+## How Kubernetes Actually Works: From YAML to Running Containers
 
 ### A. Declarative Configuration (The Core Philosophy)
 
@@ -309,6 +319,12 @@ spec:
 
 **How It Works**:
 
+![Kubernetes Service Load Balancing](./images/k8s_service_load_balancing.png)
+
+**The diagram shows the complete flow** from DNS resolution to load-balanced Pod selection. Notice the iptables rules in the side panel—that's where the magic happens!
+
+**Step-by-step breakdown**:
+
 ```mermaid
 sequenceDiagram
     participant Client
@@ -345,11 +361,15 @@ sequenceDiagram
 
 ---
 
-## 4. Deep Dive: Internal Implementation
+## Deep Dive: How Kubernetes Really Works Under the Hood
 
-### A. Scheduling: How Pods Find Homes
+### The Kubernetes Scheduler: Finding the Perfect Home for Your Pod
 
 **Scheduler's Job**: For each new Pod, pick the best node from 1,000 available nodes in <100ms.
+
+![Kubernetes Scheduler 3-Phase Process](./images/k8s_scheduler_decision_process.png)
+
+**The scheduler works in 3 distinct phases** (see diagram above). Let's break them down:
 
 **Three-Phase Process**:
 
@@ -427,7 +447,17 @@ Final Scores:
 - **1,000 Pods burst**: Scheduler processes 100 Pods/second
 - **5,000 node cluster**: Filtering + Scoring completes in 50-100ms
 
-### B. Networking Model: Every Pod Gets an IP
+### Kubernetes Networking: Why Every Pod Gets Its Own IP (No NAT!)
+
+**The Big Idea**: Unlike Docker (which uses NAT and port mapping), Kubernetes gives every Pod a unique cluster-wide IP address. Pods can talk to each other directly—no translation needed.
+
+![Docker NAT vs Kubernetes Flat Networking](./images/k8s_networking_nat_vs_flat.png)
+
+**The diagram above shows the fundamental difference**:
+- **LEFT (Docker)**: Private bridge networks, same IPs (172.17.0.2), requires NAT, port mapping confusion
+- **RIGHT (Kubernetes)**: Unique cluster IPs (10.244.x.x), direct routing, no NAT overhead
+
+Now let's understand **why** this matters by first explaining NAT:
 
 **Understanding NAT (Network Address Translation)**:
 
@@ -665,7 +695,31 @@ Step 6: CNI updates cluster routing
 | **Flannel** | VXLAN overlay | Medium (encapsulation overhead) | Simple, AWS/GCP compatibility |
 | **AWS VPC CNI** | Direct VPC IP assignment | High (no overlay) | AWS-only, uses ENI IPs |
 
-### C. Storage: Persistent Volumes
+### Persistent Storage: Keeping Your Data Alive When Pods Die
+
+**The Problem**: Containers are ephemeral. When a Pod crashes and restarts, any data stored in the container filesystem is **gone forever**.
+
+**Example Disaster**:
+```
+PostgreSQL Pod crashes
+Kubernetes restarts it on a new node
+Database is empty (all data lost!)
+Your users: 🤬
+```
+
+**The Solution**: A clever 3-layer abstraction that separates *what you want* (storage request) from *how it's provided* (actual disk):
+
+![Kubernetes PersistentVolume Binding](./images/k8s_persistent_volume_binding.png)
+
+**The diagram shows**:
+- **Pod** consumes storage through an abstract claim
+- **PVC** (PersistentVolumeClaim) is your "I need 10GB SSD" request
+- **PV** (PersistentVolume) is the Kubernetes resource representing the disk
+- **Cloud Storage** is the actual AWS EBS volume
+
+**The beauty**: Pod crashes on Node-1, restarts on Node-7, volume follows it (data intact!)
+
+Now let's see how each layer works:
 
 **Problem**: Containers are ephemeral. When a Pod restarts, all data in the container filesystem is LOST.
 
