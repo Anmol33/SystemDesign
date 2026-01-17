@@ -378,23 +378,23 @@ All clients use server port 80, differentiated by 4-tuple ✅
 
 ```mermaid
 graph LR
-    subgraph UserSpace[\"User Space\"]
-        App[\"Application Buffer<br/>send('Hello World')\"]
+    subgraph UserSpace["User Space"]
+        App["Application Buffer<br/>send('Hello World')"]
     end
     
-    subgraph Kernel[\"Kernel Space\"]
-        SendQ[\"Send Queue (SO_SNDBUF)<br/>Default: 16KB-256KB\"]
-        RecvQ[\"Receive Queue (SO_RCVBUF)<br/>Default: 128KB\"]
+    subgraph Kernel["Kernel Space"]
+        SendQ["Send Queue (SO_SNDBUF)<br/>Default: 16KB-256KB"]
+        RecvQ["Receive Queue (SO_RCVBUF)<br/>Default: 128KB"]
     end
     
-    subgraph Network[\"Network\"]
-        Wire[\"NIC / Internet\"]
+    subgraph Network["Network"]
+        Wire["NIC / Internet"]
     end
     
-    App -->|\"1. copy_from_user()\"| SendQ
-    SendQ -->|\"2. TCP segmentation<br/>3. Add headers<br/>4. DMA to NIC\"| Wire
-    Wire -->|\"5. Interrupt<br/>6. Validate checksum<br/>7. Reorder\"| RecvQ
-    RecvQ -->|\"8. copy_to_user()<br/>recv() returns\"| App
+    App -->|"1. copy_from_user()"| SendQ
+    SendQ -->|"2. TCP segmentation<br/>3. Add headers<br/>4. DMA to NIC"| Wire
+    Wire -->|"5. Interrupt<br/>6. Validate checksum<br/>7. Reorder"| RecvQ
+    RecvQ -->|"8. copy_to_user()<br/>recv() returns"| App
     
     style SendQ fill:#fff3cd
     style RecvQ fill:#e6f3ff
@@ -612,71 +612,170 @@ If packet lost and timeout:
 
 ### E. Congestion Control
 
-**Problem**: How does sender know network capacity without explicit feedback?
+**The Core Problem**: Imagine you're sending water through a pipe. If you pump too fast, the pipe bursts. If you pump too slow, you waste capacity. But here's the catch: **you don't know the pipe's capacity**, and it changes constantly (other people sharing the same Internet "pipe").
 
-**Solution**: Adaptive transmission rate using Congestion Window (cwnd)
+**TCP's Solution**: Start slowly, increase speed until you detect congestion (packet loss), then back off. Repeat forever.
 
-**Phases**:
+**Visual Overview of All 4 Phases:**
 
-**1. Slow Start** (exponential growth):
+![TCP Congestion Control Lifecycle](./images/tcp_congestion_control_lifecycle.png)
+
+**The graph above shows the complete lifecycle** of TCP's congestion window (cwnd) over time. Let's break down each phase:
+
+![TCP Congestion Phases Comparison](./images/tcp_congestion_phases_comparison.png)
+
+---
+
+#### Phase 1: Slow Start (Exponential Growth) 🚀
+
+**Goal**: Quickly find the network's capacity
+
+**How it works**:
 ```
-Steps:
-1. Initialize: cwnd = 1 MSS (1460 bytes)
-2. Send 1 segment
-3. Receive ACK → cwnd = 2 MSS
-4. Send 2 segments
-5. Receive 2 ACKs → cwnd = 4 MSS
-6. Send 4 segments
-7. Receive 4 ACKs → cwnd = 8 MSS
-... (doubles every RTT)
-
-8. When cwnd >= ssthresh (slow start threshold):
-   → Switch to Congestion Avoidance
-
-Characteristic: Exponential growth (1 → 2 → 4 → 8 → 16...)
-```
-
-**2. Congestion Avoidance** (linear growth):
-```
-Steps:
-1. cwnd >= ssthresh (e.g., 64 MSS)
-2. For each ACK received:
-   - cwnd += MSS * (MSS / cwnd)
-   - Approximately: +1 MSS per RTT
-
-3. Continue until packet loss detected
-
-Characteristic: Linear growth (64 → 65 → 66 → 67...)
+Start conservatively: cwnd = 1 MSS (1 packet)
+↓
+Send 1 packet
+↓
+Receive ACK → Double window: cwnd = 2 MSS
+↓
+Send 2 packets
+↓
+Receive 2 ACKs → Double again: cwnd = 4 MSS
+↓
+Send 4 packets
+...continues doubling every RTT...
+1 → 2 → 4 → 8 → 16 → 32 → 64...
 ```
 
-**3. Fast Recovery** (after 3 duplicate ACKs):
-```
-Steps:
-1. Detect: 3 duplicate ACKs (fast retransmit trigger)
-2. Actions:
-   - ssthresh = cwnd / 2 (cut in half)
-   - cwnd = ssthresh + 3 MSS
-   - Retransmit lost segment
-3. For each additional duplicate ACK:
-   - cwnd += MSS (temporary inflation)
-4. When new ACK arrives (acknowledging retransmitted data):
-   - cwnd = ssthresh
-   - Resume congestion avoidance
+**Why "Slow Start"?** It's actually exponential (very fast!). The name is historical—it was "slow" compared to the original TCP that sent everything at once and flooded the network.
 
-Result: Partial recovery without full slow start restart
+**When does it stop?** When `cwnd >= ssthresh` (slow start threshold), switch to Congestion Avoidance.
+
+**Real-world timing**:
+- RTT = 50ms
+- After 6 RTTs (300ms): cwnd grows from 1 to 64 packets
+- That's going from 1.4KB/sec to 91KB/sec in 0.3 seconds!
+
+---
+
+#### Phase 2: Congestion Avoidance (Linear Growth) 📈
+
+**Goal**: Carefully probe for more capacity without causing congestion
+
+**How it works**:
+```
+cwnd = 64 MSS (reached ssthresh)
+↓
+For each ACK:
+  cwnd += MSS / cwnd
+  (adds approximately 1 MSS per RTT)
+↓
+Growth becomes linear: 64 → 65 → 66 → 67 → 68...
 ```
 
-**4. Timeout Recovery** (severe congestion):
+**Why linear?** We're near the network's capacity. Growing too fast would cause packet loss. This is the "cruise control" phase.
+
+**How long does it last?** Until packet loss is detected (either by 3 duplicate ACKs or timeout).
+
+**Example**:
+- Current cwnd = 100 MSS
+- Network can handle 120 MSS
+- Linear growth will probe upward slowly
+- Eventually hits limit → packet loss at ~120 MSS
+
+---
+
+#### Phase 3: Fast Recovery (Partial Backoff) ⚡
+
+**Trigger**: Receiver sends 3 duplicate ACKs (same ACK number repeated 3 times)
+
+**What this means**: "I got packets 1, 2, 4, 5, 6 but NOT packet 3. Send packet 3 again!"
+
+**Visual walkthrough**:
+
+![TCP Fast Recovery Detailed](./images/tcp_fast_recovery_detailed.png)
+
+**Steps**:
 ```
-Steps:
-1. Retransmission timeout expires
-2. Actions:
+1. Normal transmission: cwnd = 40 MSS ✅
+
+2. Packet 3 lost in network ❌
+   Other packets (4, 5, 6) arrive out of order
+
+3. Receiver sends duplicate ACKs:
+   ACK=3 (dup #1): "Still waiting for packet 3"
+   ACK=3 (dup #2): "Still waiting for packet 3"
+   ACK=3 (dup #3): "Still waiting for packet 3"
+
+4. Sender detects 3 duplicate ACKs:
+   - This is MILD congestion (not severe)
+   - Packets are still flowing (just one loss)
+   
+   Actions:
+   ssthresh = cwnd / 2 = 20 MSS
+   cwnd = ssthresh + 3 = 23 MSS
+   Retransmit packet 3 immediately 🔄
+
+5. For each additional duplicate ACK:
+   cwnd += 1 MSS (temporary inflation)
+   
+6. New ACK arrives (acknowledging retransmitted packet 3):
+   cwnd = ssthresh = 20 MSS
+   Resume Congestion Avoidance ✅
+```
+
+**Why not reset to cwnd=1?** Because the network isn't dead—it's just congested. Packets are still flowing. We cut the window in half and continue.
+
+**Key insight**: Fast Recovery is TCP saying "oops, slow down a bit" rather than "panic and start over."
+
+---
+
+#### Phase 4: Timeout Recovery (Severe Congestion) 🔴
+
+**Trigger**: Retransmission Timeout (RTO) expires—no ACK received for a long time
+
+**What this means**: The network might be severely congested or broken. No packets are getting through.
+
+**Steps**:
+```
+1. RTO expires (default ~200ms minimum) ⏰
+
+2. TCP panics:
    - ssthresh = cwnd / 2
-   - cwnd = 1 MSS (restart from scratch)
-   - Enter slow start again
+   - cwnd = 1 MSS (restart from scratch!)
+   - Enter Slow Start again 🚀
 
-Result: Back to exponential growth from 1 MSS
+3. Result: Back to exponential growth from 1 MSS
 ```
+
+**Why so drastic?** A timeout suggests severe congestion. Better to be conservative and rebuild slowly.
+
+**Example timeline**:
+```
+t=0: cwnd = 64 MSS, send packets
+t=50ms: No ACK arrives
+t=100ms: Still no ACK
+t=200ms: Timeout! RTO expired
+         → cwnd crashes to 1 MSS
+         → ssthresh = 32 MSS
+         → Start over with Slow Start
+```
+
+---
+
+#### Comparison: Fast Recovery vs Timeout Recovery
+
+| Scenario | Signal | Response | Recovery Time |
+|----------|--------|----------|---------------|
+| **Fast Recovery** | 3 duplicate ACKs | Partial backoff (cwnd/2) | ~1-2 RTTs |
+| **Timeout** | No ACK received | Full reset (cwnd=1) | ~6-10 RTTs |
+
+**Fast Recovery** = Minor congestion, quick recovery
+**Timeout** = Severe congestion, slow recovery
+
+---
+
+**Modern Algorithms**:
 
 **Modern Algorithms**:
 
