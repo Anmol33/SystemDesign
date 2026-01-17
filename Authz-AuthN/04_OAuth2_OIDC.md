@@ -944,6 +944,42 @@ Different clients need different flows.
 
 ---
 
+###  Visual: OAuth 2.0 Flow Diagrams
+
+#### Authorization Code Flow (Confidential Clients)
+
+![OAuth 2.0 Authorization Code Flow](/Users/anmol.shrivastava/.gemini/antigravity/brain/2503e41c-b41e-4f44-8619-686cc7836aff/oauth_authorization_code_flow.png)
+
+**Key Points:**
+- **Front-channel**: Browser redirects (public, steps 1-4)
+- **Back-channel**: Server-to-server with client_secret (secure, step 5)
+- **Most secure**: Code useless without client_secret
+
+---
+
+#### Authorization Code Flow with PKCE (Public Clients: Mobile/SPA)
+
+![OAuth 2.0 PKCE Flow](/Users/anmol.shrivastava/.gemini/antigravity/brain/2503e41c-b41e-4f44-8619-686cc7836aff/oauth_pkce_flow.png)
+
+**Key Points:**
+- **PKCE** prevents code interception attacks
+- **code_verifier**: Random secret (stays on device)
+- **code_challenge**: SHA-256 hash of verifier (sent to server)
+- **Verification**: Server validates challenge matches verifier
+
+---
+
+#### Client Credentials Flow (Machine-to-Machine)
+
+![OAuth 2.0 Client Credentials Flow](/Users/anmol.shrivastava/.gemini/antigravity/brain/2503e41c-b41e-4f44-8619-686cc7836aff/oauth_client_credentials_flow.png)
+
+**Key Points:**
+- **No user involved**: Service-to-service authentication
+- **Direct token**: No authorization code step
+- **Use case**: Cron jobs, microservices, backend services
+
+---
+
 ## 4. Deep Dive: Authorization Code Flow with PKCE
 
 **PKCE** (Proof Key for Code Exchange) prevents "Code Interception" attacks on public clients (Mobile/SPA) that cannot store a client secret safely.
