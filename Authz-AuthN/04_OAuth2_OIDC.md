@@ -1057,24 +1057,15 @@ sequenceDiagram
 
 ---
 
-## 5. End-to-End Walkthrough: "Login with Google" (OIDC)
-
-**For a complete, detailed walkthrough including all internal server processing, see:**  
-**→ [05_OIDC_Deep_Dive_Flow.md](./05_OIDC_Deep_Dive_Flow.md)**
-
-The deep-dive document covers:
-- What Google does with authorization code (11 validation steps)
-- What PhotoApp does with ID Token (11 processing steps)
-- All security checkpoints
-- Complete code examples
-- Timeline of events
-- What gets stored where
-
 ---
 
-### Quick Overview
+## Let's See It in Action: "Login with Google"
 
-**High-level flow:**
+The best way to understand OAuth and OIDC is to walk through a real example. Let's watch what happens when Alice clicks "Login with Google" on PhotoApp.
+
+**(Want the full deep-dive with every internal step? Check out [05_OIDC_Deep_Dive_Flow.md](./05_OIDC_Deep_Dive_Flow.md))**
+
+### The Complete Flow at a Glance
 
 ```mermaid
 sequenceDiagram
