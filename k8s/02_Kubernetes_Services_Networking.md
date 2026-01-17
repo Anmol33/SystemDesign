@@ -109,6 +109,128 @@ Node-3's Pods: 10.244.3.0/24 range
 
 ---
 
+### How Does CNI Know Which Node Has Which Pod?
+
+**The Question**: When Pod-A sends a packet to Pod-D on a different node, how does the CNI plugin know where to send it?
+
+**The Simple Answer**: Each node gets a unique Pod subnet, and this mapping is like an address book that every node has!
+
+#### Step 1: Each Node Gets Its Own Pod Range
+
+```
+When nodes join the cluster:
+
+Node-1 (192.168.1.10) gets: 10.244.1.0/24
+  → Can assign IPs: 10.244.1.1 to 10.244.1.254
+
+Node-2 (192.168.1.11) gets: 10.244.2.0/24
+  → Can assign IPs: 10.244.2.1 to 10.244.2.254
+
+Node-3 (192.168.1.12) gets: 10.244.3.0/24
+  → Can assign IPs: 10.244.3.1 to 10.244.3.254
+```
+
+**Key insight**: The Pod IP tells you which node! 
+- IP starts with `10.244.1.x`? Must be on Node-1
+- IP starts with `10.244.2.x`? Must be on Node-2
+
+#### Step 2: CNI Creates Routing Rules
+
+On **every node**, CNI creates a routing table:
+
+```bash
+# On Node-1, routing rules:
+$ ip route
+
+10.244.1.0/24 dev cni0          # Local Pods (on this node)
+10.244.2.0/24 via 192.168.1.11  # Pods on Node-2 → send to Node-2 IP
+10.244.3.0/24 via 192.168.1.12  # Pods on Node-3 → send to Node-3 IP
+```
+
+**Translation**:
+- "If packet destination is `10.244.2.x`, send it to Node-2 (`192.168.1.11`)"
+- "If packet destination is `10.244.3.x`, send it to Node-3 (`192.168.1.12`)"
+
+#### Step 3: Packet Uses This Routing Table
+
+**Example**: Pod-A (10.244.1.5 on Node-1) → Pod-D (10.244.2.5 on Node-2)
+
+```
+1. Pod-A creates packet:
+   Src: 10.244.1.5
+   Dst: 10.244.2.5
+
+2. Kernel checks routing table:
+   "Where does 10.244.2.5 go?"
+   Finds: "10.244.2.0/24 via 192.168.1.11"
+   
+3. Kernel knows: "Send to Node-2 at 192.168.1.11"
+
+4. CNI encapsulates packet:
+   Outer header (for Node network):
+     Src: 192.168.1.10 (Node-1)
+     Dst: 192.168.1.11 (Node-2)
+   Inner packet (original):
+     Src: 10.244.1.5 (Pod-A)
+     Dst: 10.244.2.5 (Pod-D)
+
+5. Packet travels over Node network to Node-2
+
+6. Node-2 CNI decapsulates, delivers to Pod-D
+```
+
+#### Where Does This Mapping Come From?
+
+**Kubernetes API Server** stores the node-to-subnet mapping:
+
+```
+┌─────────────────────────┐
+│  Kubernetes API Server  │  Stores in etcd:
+│  (etcd)                 │  - Node-1: 10.244.1.0/24
+└───────────┬─────────────┘  - Node-2: 10.244.2.0/24
+            │                - Node-3: 10.244.3.0/24
+            │
+    ┌───────┴────────┬──────────────┐
+    ▼                ▼              ▼
+┌─────────┐      ┌─────────┐   ┌─────────┐
+│ Node-1  │      │ Node-2  │   │ Node-3  │
+│ CNI     │      │ CNI     │   │ CNI     │
+└─────────┘      └─────────┘   └─────────┘
+
+Each CNI daemon:
+1. Watches API for node changes
+2. Gets subnet assignments
+3. Creates local routing rules
+```
+
+**When a new node joins**:
+1. Kubernetes assigns it a subnet (e.g., `10.244.4.0/24`)
+2. All CNI daemons see this via API watch
+3. They add route: `10.244.4.0/24 via <new-node-ip>`
+
+#### Real Example
+
+**Node-1 starts with only itself**:
+```bash
+$ ip route
+10.244.1.0/24 dev cni0  # Local Pods only
+```
+
+**Node-2 joins cluster (gets 10.244.2.0/24, IP: 192.168.1.11)**:
+
+**CNI on Node-1 automatically adds**:
+```bash
+$ ip route
+10.244.1.0/24 dev cni0
+10.244.2.0/24 via 192.168.1.11  # ← NEW! Route to Node-2's Pods
+```
+
+**The Magic**: It's not "figuring out" at packet time—routing rules are **pre-configured** based on cluster state!
+
+---
+
+---
+
 ### Layer 3: Service Network (Virtual Layer - 10.96.x.x)
 
 **What it is**: Virtual IPs (VIPs) that **don't actually exist anywhere** - just configuration in etcd!
