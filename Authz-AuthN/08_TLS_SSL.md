@@ -15,9 +15,9 @@
 
 ---
 
-## 2. Core Architecture
+## How Does TLS Fit into the Web Stack?
 
-The TLS connection happens *below* HTTP.
+TLS sits between your application data (HTTP) and the low-level network transport (TCP/IP).
 
 ```mermaid
 graph TD
@@ -41,9 +41,14 @@ graph TD
 
 ---
 
-## 3. How It Works: The TLS 1.3 Handshake
+## The TLS Handshake: How Encryption Actually Starts
 
-TLS 1.3 reduces the RTT (Round Trip Time) from 2 (in TLS 1.2) to **1-RTT**.
+When you visit an HTTPS website, your browser and the server need to agree on encryption keys. This negotiation is called the **TLS handshake**.
+
+**TLS 1.3 (Modern):** Optimized to just **1 round-trip** (super fast)
+**TLS 1.2 (Legacy):** Required **2 round-trips** (slower)
+
+![TLS 1.3 Handshake Process](./images/tls_handshake_visual.png)
 
 ```mermaid
 sequenceDiagram
@@ -79,9 +84,11 @@ sequenceDiagram
 
 ---
 
-## 4. Deep Dive: Certificate Chain of Trust
+## But Wait—How Do You Know It's Really Google?
 
-How does your browser trust `google.com`?
+This is where certificates come in. **Anyone** can encrypt data. The real question is: **Are you talking to the real google.com or an imposter?**
+
+### The Chain of Trust
 
 ```mermaid
 graph TB
@@ -118,11 +125,19 @@ graph TB
 
 ---
 
-## 5. End-to-End Walkthrough: Mutual TLS (mTLS)
+## Going Beyond: Mutual TLS (Both Sides Prove Identity)
 
-Standard TLS validates the *Server*. **mTLS** validates the *Client* too. Common in Zero Trust / Microservices.
+Standard TLS only validates the server (the website proves it's really google.com). But what if the server also wants to know WHO the client is?
 
-**Scenario**: Service A calling Service B (Internal).
+**That's Mutual TLS (mTLS).**
+
+**Common in:**
+- Microservices (Service A calling Service B)
+- Zero Trust architectures
+- Banking APIs
+- Enterprise internal systems
+
+**How it works:**
 
 1.  **Service A (Client)** Hello.
 2.  **Service B (Server)** Hello + "Send me YOUR certificate".
@@ -132,7 +147,7 @@ Standard TLS validates the *Server*. **mTLS** validates the *Client* too. Common
 
 ---
 
-## 6. Failure Scenarios
+## What Can Go Wrong? Common TLS/SSL Failures
 
 ### Scenario A: Certificate Expired
 **Symptom**: Users see full-screen browser warning, site abandonment.
@@ -225,7 +240,7 @@ sequenceDiagram
 
 ---
 
-## 7. Performance Tuning
+## Making TLS Fast: Performance Optimizations
 
 | Optimization | Description | Impact |
 | :--- | :--- | :--- |
@@ -237,7 +252,7 @@ sequenceDiagram
 
 ---
 
-## 8. Constraints & Limitations
+## TLS Trade-offs: What You Should Know
 
 | Constraint | Limit | Why? |
 | :--- | :--- | :--- |
@@ -247,7 +262,7 @@ sequenceDiagram
 
 ---
 
-## 9. When to Use?
+## When Do You Need TLS?
 
 | Scenario | Verdict | Why? |
 | :--- | :--- | :--- |
@@ -258,7 +273,7 @@ sequenceDiagram
 
 ---
 
-## 10. Production Checklist
+## Production Best Practices: TLS/SSL Checklist
 
 1.  [ ] **Disable TLS 1.0/1.1**: They are broken. Support only 1.2 and 1.3.
 2.  [ ] **Use HSTS**: Set header `Strict-Transport-Security: max-age=31536000; includeSubDomains`.
