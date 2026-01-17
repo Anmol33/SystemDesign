@@ -59,30 +59,157 @@ OAuth Approach (Delegated Access):
 
 **OAuth 2.0 problem:** It only handles *authorization* (what you can access), not *authentication* (who you are).
 
+Let's see this with a concrete example:
+
+**The Three Actors:**
+1. **Alice** (User) - Owns Facebook photos
+2. **Facebook** (Identity Provider / IdP) - Stores Alice's data
+3. **Photo Printing Service** (Client) - Wants to print Alice's photos
+
+---
+
+**Scenario: OAuth 2.0 Access Token Only (Without OIDC)**
+
+**Step 1: Alice Authorizes**
 ```
-OAuth 2.0 alone:
-  Photo Service: "I have permission to access your photos"
-  Photo Service: "But... who are you exactly?"
-  
-  Token contains:
-  - Access to /api/photos ✓
-  - User identity? ❌
+Alice: "I want to print my Facebook photos"
+       ↓
+Photo Service: "Redirect to Facebook for authorization"
+       ↓
+Facebook: "Alice, Photo Service wants to access your photos. Allow?"
+       ↓
+Alice: [clicks "Allow"]
 ```
 
-**OIDC solution:** Layer on top of OAuth 2.0 that adds identity information.
+**Step 2: Facebook Issues Access Token**
+```json
+// Facebook → Photo Service
+{
+  "access_token": "fb_token_abc123",
+  "scope": "read:photos",
+  "user_id": "12345678"  // Just Facebook's internal ID
+  // ❌ NO email
+  // ❌ NO name
+  // ❌ NO profile info
+}
+```
 
+**Step 3: Photo Service's Problem**
+```javascript
+// Photo Service can access photos
+GET /me/photos
+Authorization: Bearer fb_token_abc123
+// ✓ Works! Gets photos
+
+// But then Photo Service needs to:
+function sendInvoiceEmail() {
+  const userEmail = ???  // ❌ Don't have this!
+  sendEmail(userEmail, "Invoice for your prints")
+}
+
+function printNameOnPackage() {
+  const userName = ???  // ❌ Don't have this!
+  return `Package for: ${userName}`
+}
 ```
-OAuth 2.0 + OIDC:
-  Photo Service: "I have permission to access your photos"
-  Photo Service: "And I know you're Alice (alice@gmail.com)"
+
+**The Problem:**
+```
+Photo Service knows:
+  ✅ I can access someone's photos (scope granted)
+  ✅ I have user_id "12345678" (opaque identifier)
+  ❌ Who is this user? (no email)
+  ❌ What's their name? (no name)
+  ❌ How do I contact them? (no contact info)
+```
+
+---
+
+**OIDC Solution: OAuth 2.0 + ID Token**
+
+**Same Step 1: Alice Authorizes** (unchanged)
+
+**Step 2: Facebook Issues TWO Tokens**
+```json
+// Facebook → Photo Service
+{
+  // Access Token (for API access - same as before)
+  "access_token": "fb_token_abc123",
+  "scope": "read:photos",
   
-  ID Token contains:
-  {
-    "sub": "user123",
-    "email": "alice@gmail.com",
-    "name": "Alice Smith"
-  }
+  // ID Token (for identity - THIS IS NEW!)
+  "id_token": "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9..."
+}
 ```
+
+**ID Token Decoded:**
+```json
+{
+  "iss": "https://facebook.com",
+  "sub": "12345678",
+  "email": "alice@gmail.com",        // ✓ Now have email!
+  "name": "Alice Smith",             // ✓ Now have name!
+  "picture": "https://fb.com/...",   // ✓ Profile picture
+  "email_verified": true
+}
+```
+
+**Step 3: Photo Service Now Has Identity**
+```javascript
+// Verify and extract identity from ID Token
+const claims = jwt.verify(response.id_token, facebookPublicKey)
+
+// Create user account
+db.users.create({
+  email: claims.email,      // "alice@gmail.com"
+  name: claims.name,        // "Alice Smith"
+  facebookId: claims.sub    // "12345678"
+})
+
+// Now everything works!
+function sendInvoiceEmail() {
+  sendEmail(claims.email, "Invoice for your prints")  // ✓ Works!
+}
+
+function printNameOnPackage() {
+  return `Package for: ${claims.name}`  // ✓ "Package for: Alice Smith"
+}
+```
+
+**Photo Service now knows:**
+```
+✅ Can access Alice's photos (Access Token)
+✅ User is Alice Smith (ID Token)
+✅ Email: alice@gmail.com (ID Token)
+✅ Can send invoice and contact user
+```
+
+---
+
+**Visual Comparison:**
+
+```mermaid
+sequenceDiagram
+    participant Alice as Alice<br/>(User)
+    participant FB as Facebook<br/>(IdP)
+    participant Photo as Photo Service<br/>(Client)
+    
+    rect rgb(255, 230, 230)
+        Note over Alice,Photo: OAuth 2.0 Only (Access Token)
+        Alice->>FB: Authorize Photo Service
+        FB->>Photo: Access Token<br/>(scope: read:photos)
+        Photo->>Photo: ✓ Can access photos<br/>❌ Don't know who user is
+    end
+    
+    rect rgb(230, 255, 230)
+        Note over Alice,Photo: OAuth 2.0 + OIDC (Both Tokens)
+        Alice->>FB: Authorize Photo Service
+        FB->>Photo: Access Token + ID Token<br/>(access + identity)
+        Photo->>Photo: ✓ Can access photos<br/>✓ Know user is Alice<br/>✓ Have email/name
+    end
+```
+
+---
 
 **Analogy: Valet Parking**
 
