@@ -948,7 +948,7 @@ Different clients need different flows.
 
 #### Authorization Code Flow (Confidential Clients)
 
-![OAuth 2.0 Authorization Code Flow](/Users/anmol.shrivastava/.gemini/antigravity/brain/2503e41c-b41e-4f44-8619-686cc7836aff/oauth_authorization_code_flow.png)
+![OAuth 2.0 Authorization Code Flow](./images/oauth_authorization_code_flow.png)
 
 **Key Points:**
 - **Front-channel**: Browser redirects (public, steps 1-4)
@@ -959,7 +959,7 @@ Different clients need different flows.
 
 #### Authorization Code Flow with PKCE (Public Clients: Mobile/SPA)
 
-![OAuth 2.0 PKCE Flow](/Users/anmol.shrivastava/.gemini/antigravity/brain/2503e41c-b41e-4f44-8619-686cc7836aff/oauth_pkce_flow.png)
+![OAuth 2.0 PKCE Flow](./images/oauth_pkce_flow.png)
 
 **Key Points:**
 - **PKCE** prevents code interception attacks
@@ -971,7 +971,7 @@ Different clients need different flows.
 
 #### Client Credentials Flow (Machine-to-Machine)
 
-![OAuth 2.0 Client Credentials Flow](/Users/anmol.shrivastava/.gemini/antigravity/brain/2503e41c-b41e-4f44-8619-686cc7836aff/oauth_client_credentials_flow.png)
+![OAuth 2.0 Client Credentials Flow](./images/oauth_client_credentials_flow.png)
 
 **Key Points:**
 - **No user involved**: Service-to-service authentication
