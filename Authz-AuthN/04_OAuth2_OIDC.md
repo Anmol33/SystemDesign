@@ -818,49 +818,152 @@ sequenceDiagram
 
 ---
 
-## 5. End-to-End Walkthrough: "Log in with Google" (OIDC)
+## 5. End-to-End Walkthrough: "Login with Google" (OIDC)
 
-Scenario: User logs into a generic SaaS app using Google.
+**For a complete, detailed walkthrough including all internal server processing, see:**  
+**→ [05_OIDC_Deep_Dive_Flow.md](./05_OIDC_Deep_Dive_Flow.md)**
 
-### Step 1: Redirect to Provider
-User clicks "Login". Component constructs URL:
-`https://accounts.google.com/o/oauth2/v2/auth?scope=openid email profile...`
+The deep-dive document covers:
+- What Google does with authorization code (11 validation steps)
+- What PhotoApp does with ID Token (11 processing steps)
+- All security checkpoints
+- Complete code examples
+- Timeline of events
+- What gets stored where
 
-### Step 2: User Consents
-Google checks if user is logged in. If not, prompts for password. Then asks: "Allow SaaS App to view email?"
+---
 
-### Step 3: Callback
-Google redirects to `https://saas-app.com/callback?code=ab123`.
+### Quick Overview
 
-### Step 4: Token Exchange (Back-Channel)
-SaaS Server sends Code + Client Secret to Google.
-Google returns:
-- **ID Token**: "This is Alice (alice@gmail.com)"
-- **Access Token**: "You can call Google Contacts API"
-
-### Step 5: Validation
-SaaS Server verifies ID Token signature (JWT).
-SaaS Server creates a local **Session** for Alice.
+**High-level flow:**
 
 ```mermaid
 sequenceDiagram
-    participant Browser
-    participant Server as SaaS Server
-    participant Google
+    participant Alice as Alice<br/>(User)
+    participant Browser as Browser
+    participant PhotoApp as PhotoApp Server
+    participant Google as Google<br/>(IdP)
     
-    Browser->>Server: Click "Login with Google"
-    Server-->>Browser: 302 Redirect (Google /auth)
-    Browser->>Google: Authenticate & Consent
-    Google-->>Browser: 302 Redirect (/callback?code=123)
-    Browser->>Server: GET /callback?code=123
+    Note over Alice,Google: 1. Initiate Login
+    Alice->>PhotoApp: Click "Login with Google"
+    PhotoApp->>Browser: Redirect to Google<br/>(with client_id, scope, nonce)
     
-    Server->>Google: POST /token (code + secret)
-    Google-->>Server: { id_token="eyJ...", access_token="ya29..." }
+    Note over Alice,Google: 2. Authentication & Consent
+    Browser->>Google: GET /auth (authorization request)
+    Google->>Alice: Show login page
+    Alice->>Google: Enter credentials
+    Google->>Google: Authenticate user ✓
+    Google->>Alice: Show consent: "PhotoApp wants email?"
+    Alice->>Google: Click "Allow"
     
-    Server->>Server: Validate ID Token<br/>Create Local Session
+    Note over Alice,Google: 3. Authorization Code
+    Google->>Google: Generate auth code (60s)
+    Google->>Browser: Redirect to PhotoApp<br/>(/callback?code=AUTH_CODE)
+    Browser->>PhotoApp: GET /callback?code=AUTH_CODE
     
-    Server-->>Browser: Set-Cookie: session_id=...
+    Note over Alice,Google: 4. Token Exchange (Back-Channel)
+    PhotoApp->>Google: POST /token<br/>(code + client_secret)
+    Google->>Google: Validate everything<br/>Generate & sign ID Token
+    Google->>PhotoApp: ID Token + Access Token
+    
+    Note over Alice,Google: 5. User Session
+    PhotoApp->>PhotoApp: Verify ID Token signature<br/>Extract user info<br/>Create/update user<br/>Create session
+    PhotoApp->>Browser: Set session cookie
+    Browser->>PhotoApp: Access /dashboard
+    PhotoApp->>Alice: Welcome, Alice!
 ```
+
+---
+
+### Key Steps Summary
+
+**Step 1: Redirect to Google**
+```
+PhotoApp creates URL with:
+- client_id (who is asking)
+- scope=openid email profile (what data)
+- response_type=code (want auth code)
+- nonce (replay protection)
+```
+
+**Step 2: User Authenticates & Consents**
+```
+Google verifies password
+Shows: "PhotoApp wants to view your email. Allow?"
+User clicks: Allow
+```
+
+**Step 3: Google Issues Authorization Code**
+```
+Google creates: 60-second temporary code
+Redirects browser: photoapp.com/callback?code=AUTH_CODE
+```
+
+**Step 4: PhotoApp Exchanges Code for Tokens (Server-to-Server)**
+```
+PhotoApp → Google: code + client_secret
+Google validates: client, code, redirect_uri
+Google responds: ID Token (signed JWT)
+```
+
+**Step 5: PhotoApp Verifies & Creates Session**
+```
+Verify ID Token signature with Google's public key
+Extract: email, name, picture
+Create user account (if new)
+Create session
+Send session cookie to browser
+```
+
+---
+
+### What Browser Stores
+
+```javascript
+// Browser Cookie Jar after login:
+
+Cookie 1:
+  Domain: .google.com
+  Name: SID
+  Value: google_session_xyz
+  Purpose: Access Gmail, YouTube, etc.
+
+Cookie 2:
+  Domain: photoapp.com
+  Name: session_id
+  Value: photoapp_session_abc
+  Purpose: Access PhotoApp
+
+// Browser NEVER stores:
+// - ID Token (stays on PhotoApp server)
+// - Access Token (stays on PhotoApp server)
+// - Client Secret (PhotoApp server only)
+```
+
+---
+
+### Security Highlights
+
+**Authorization Code (Front-Channel):**
+- ✅ Visible in browser URL (public)
+- ✅ 60-second lifespan
+- ✅ One-time use only
+- ✅ Useless without client_secret
+
+**ID Token Exchange (Back-Channel):**
+- ✅ Server-to-server (browser doesn't see)
+- ✅ Requires client_secret
+- ✅ ID Token signed by Google's private key
+- ✅ PhotoApp verifies with Google's public key
+
+**Result:**
+- Browser never sees sensitive tokens
+- PhotoApp can trust ID Token (cryptographic proof)
+- User has session with both Google AND PhotoApp
+
+---
+
+**For complete details, see [05_OIDC_Deep_Dive_Flow.md](./05_OIDC_Deep_Dive_Flow.md)**
 
 ---
 
