@@ -384,6 +384,17 @@ User → [authorizes limited access] → Third-party app
 
 ---
 
+### Visual Comparison: OAuth 2.0 vs OIDC
+
+![OAuth 2.0 vs OIDC Comparison](./images/oidc_vs_oauth_comparison.png)
+
+**Key Understanding:**
+- **OAuth 2.0** (Left): Authorization - Access Token for API delegation
+- **OIDC** (Right): Authentication - ID Token for user identity  
+- **Together**: OIDC = OAuth 2.0 + Identity Layer
+
+---
+
 ## 2. Core Architecture: The Four Roles
 
 OAuth 2.0 defines four distinct roles in the authorization flow. Understanding these is critical to understanding how OAuth works.
