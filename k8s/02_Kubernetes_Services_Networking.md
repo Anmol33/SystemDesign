@@ -275,24 +275,9 @@ Now that you understand the three network layers, let's understand Services conc
 
 **Conceptual view**:
 
-```mermaid
-graph LR
-    Client[Client<br/>Doesn't know Pods exist]
-    
-    Service[Service<br/>Stable Endpoint<br/>10.96.0.20]
-    
-    Pod1[Pod-1<br/>10.244.1.5]
-    Pod2[Pod-2<br/>10.244.1.6]
-    Pod3[Pod-3<br/>10.244.2.8]
-    
-    Client -->|"backend-service"| Service
-    Service -->|Automatically<br/>load balances| Pod1
-    Service --> Pod2
-    Service --> Pod3
-    
-    style Service fill:#ffeb3b
-    style Client fill:#90caf9
-```
+![Service as Abstraction Layer](./images/k8s_service_abstraction.png)
+
+**A Service provides a protective shield**: Stable endpoint that hides Pod dynamics (scaling, crashes, restarts).
 
 **A Service is an abstraction layer**:
 - Provides stable endpoint (VIP + DNS name)
@@ -429,31 +414,9 @@ Most people skip this and jump to packet flow. But **you can't understand packet
 
 Services require **three separate components** that many people don't realize exist:
 
-```mermaid
-graph TB
-    User[kubectl create service] --> API[API Server]
-    
-    subgraph Control["Control Plane Components"]
-        API[API Server + etcd<br/>Stores Service definition]
-        EC[Endpoints Controller<br/>Discovers Pods]
-    end
-    
-    subgraph Data["Data Plane (Every Node)"]
-        KP[kube-proxy<br/>Programs iptables]
-        IPT[iptables rules<br/>Route packets]
-    end
-    
-    API --> EC
-    API --> KP
-    EC --> KP
-    KP --> IPT
-    
-    Pods[Pods with labels] -.watches.-> EC
-    
-    style EC fill:#ff9999
-    style KP fill:#9999ff
-    style API fill:#ffff99
-```
+![Three Components Architecture](./images/k8s_service_three_components.png)
+
+**The three components work together**: User creates Service → API Server stores it → Endpoints Controller discovers Pods → creates Endpoints → kube-proxy watches Endpoints → programs iptables → routing is live!
 
 **The three components**:
 1. **API Server + etcd**: Stores Service definition, allocates ClusterIP
@@ -512,26 +475,9 @@ The Service is just **configuration** - a wish list saying "I want a stable endp
 - Runs as part of kube-controller-manager
 - **Job**: Watch Services and Pods, create Endpoints objects
 
-```mermaid
-sequenceDiagram
-    participant EC as Endpoints Controller
-    participant API as Kubernetes API
-    participant Pods as Pods
-    
-    Note over EC: Watches Services<br/>+ Pods continuously
-    
-    API->>EC: Service "backend" created<br/>selector: app=backend
-    
-    EC->>Pods: Query: Which Pods have<br/>label app=backend?
-    
-    Note over Pods: Pod-1: app=backend ✓<br/>Pod-2: app=backend ✓<br/>Pod-3: app=web ✗
-    
-    Pods-->>EC: Found: Pod-1 (10.244.1.5)<br/>Pod-2 (10.244.1.6)
-    
-    EC->>API: Create Endpoints object<br/>"backend"
-    
-    Note over API: Endpoints: backend<br/>Addresses:<br/>- 10.244.1.5:8080<br/>- 10.244.1.6:8080
-```
+![Endpoints Controller Flow](./images/k8s_endpoints_controller_flow.png)
+
+**Step-by-step**: Endpoints Controller watches both Services and Pods → matches selector labels → creates Endpoints object with discovered Pod IPs.
 
 #### How Endpoints Get Created (Step-by-Step)
 
@@ -871,34 +817,9 @@ Backend Pods: 10.244.1.5, 10.244.1.6, 10.244.2.8
 
 **Complete packet journey**:
 
-```mermaid
-sequenceDiagram
-    participant Client as Frontend Pod<br/>10.244.1.3
-    participant DNS as CoreDNS
-    participant IPT as iptables<br/>(Node-1)
-    participant Pod as Backend Pod<br/>10.244.1.5
+![ClusterIP Packet Journey](./images/k8s_packet_journey_clusterip.png)
 
-    Client->>DNS: nslookup backend
-    DNS-->>Client: 10.96.0.20
-
-    Client->>Client: Create packet<br/>dst: 10.96.0.20:80
-    
-    Client->>IPT: Packet enters<br/>PREROUTING
-    
-    Note over IPT: Match: KUBE-SERVICES<br/>Jump to KUBE-SVC-BACKEND
-    
-    Note over IPT: Random selection<br/>(33% chance)
-    
-    Note over IPT: DNAT transformation<br/>dst: 10.96.0.20:80 →<br/>10.244.1.5:8080
-    
-    IPT->>Pod: Routed to Pod
-    
-    Pod-->>IPT: Response
-    
-    Note over IPT: Reverse SNAT<br/>src: 10.244.1.5 →<br/>10.96.0.20
-    
-    IPT-->>Client: Response appears<br/>from Service VIP
-```
+**Complete journey**: DNS resolution → packet creation → iptables intercepts → DNAT transforms ClusterIP to Pod IP → Pod receives → response uses SNAT back to ClusterIP.
 
 **Step-by-step**:
 
