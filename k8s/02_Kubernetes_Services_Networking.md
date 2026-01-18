@@ -1183,6 +1183,78 @@ graph TB
 
 ---
 
+### How iptables Chains Are Structured
+
+**Visual representation of the chain hierarchy:**
+
+```mermaid
+graph TB
+    Packet[Incoming Packet<br/>dst: 10.96.0.20:80]
+    
+    Packet --> PREROOT[PREROUTING Chain]
+    PREROOT --> KUBESVC[KUBE-SERVICES Chain]
+    
+    KUBESVC --> Match{Match Service?<br/>dst=10.96.0.20:80}
+    Match -->|Yes| SVC[KUBE-SVC-BACKEND<br/>Service Chain]
+    Match -->|No| Other[Other rules...]
+    
+    SVC --> LB{Load Balance<br/>Random Selection}
+    
+    LB -->|33%| SEP1[KUBE-SEP-POD1<br/>Endpoint Chain]
+    LB -->|33%| SEP2[KUBE-SEP-POD2<br/>Endpoint Chain]
+    LB -->|34%| SEP3[KUBE-SEP-POD3<br/>Endpoint Chain]
+    
+    SEP1 --> DNAT1[DNAT<br/>→ 10.244.1.5:8080]
+    SEP2 --> DNAT2[DNAT<br/>→ 10.244.1.6:8080]
+    SEP3 --> DNAT3[DNAT<br/>→ 10.244.2.8:8080]
+    
+    DNAT1 --> POD1[Pod-1]
+    DNAT2 --> POD2[Pod-2]
+    DNAT3 --> POD3[Pod-3]
+    
+    style Match fill:#ffffcc
+    style LB fill:#ccffcc
+    style SVC fill:#ccccff
+```
+
+**Viewing actual chains**:
+
+```bash
+# See all kube-proxy chains
+$ sudo iptables -t nat -L -n | grep KUBE- | head -20
+
+Chain KUBE-SERVICES (2 references)
+Chain KUBE-SVC-BACKEND (1 references)
+Chain KUBE-SEP-POD1 (1 references)
+Chain KUBE-SEP-POD2 (1 references)
+Chain KUBE-SEP-POD3 (1 references)
+
+# See specific Service chain
+$ sudo iptables -t nat -L KUBE-SVC-BACKEND -n
+
+Chain KUBE-SVC-BACKEND (1 references)
+target     prot opt source       destination
+KUBE-SEP-POD1  all  --  0.0.0.0/0  0.0.0.0/0  statistic mode random probability 0.33333
+KUBE-SEP-POD2  all  --  0.0.0.0/0  0.0.0.0/0  statistic mode random probability 0.50000
+KUBE-SEP-POD3  all  --  0.0.0.0/0  0.0.0.0/0
+
+# See Pod endpoint chain
+$ sudo iptables -t nat -L KUBE-SEP-POD1 -n
+
+Chain KUBE-SEP-POD1 (1 references)
+target     prot opt source         destination
+DNAT       tcp  --  0.0.0.0/0      0.0.0.0/0  tcp to:10.244.1.5:8080
+```
+
+**The probability math**:
+- 3 Pods total
+- Pod 1: 33.3% chance (1/3)
+- Pod 2: 50% of remaining 66.7% = 33.3% (1/2 of remaining 2)
+- Pod 3: 100% of remaining 33.3% = 33.3% (last one)
+- Result: Perfect 33/33/33 distribution!
+
+---
+
 ## How Packets Travel: The Complete Picture
 
 Let's trace a **NodePort** request showing all three network layers:
