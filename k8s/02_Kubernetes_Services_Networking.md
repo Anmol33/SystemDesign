@@ -691,6 +691,498 @@ CNAME: db.external.com
 
 ---
 
+---
+
+## The Control Plane: How Services Actually Work Behind the Scenes
+
+**Before understanding how packets flow, you need to understand HOW the routing rules get created in the first place.**
+
+This is the missing piece that confuses everyone!
+
+### The Three Components That Make Services Work
+
+Services require **three separate components** working together:
+
+```mermaid
+graph TB
+    User[kubectl create service] --> API[API Server + etcd]
+    API --> |Stores Service| Service[Service Object<br/>ClusterIP: 10.96.0.20<br/>Selector: app=backend]
+    
+    Service --> EC[Endpoints Controller]
+    Pods[Pods with label app=backend] --> EC
+    
+    EC --> |Creates| Endpoints[Endpoints Object<br/>IPs: 10.244.1.5, 10.244.1.6]
+    
+    Endpoints --> |Watches| KP[kube-proxy<br/>on every node]
+    Service --> |Watches| KP
+    
+    KP --> |Programs| IPT[iptables rules]
+    
+    style EC fill:#f9f,stroke:#333
+    style KP fill:#bbf,stroke:#333
+    style IPT fill:#bfb,stroke:#333
+```
+
+**The three components**:
+1. **API Server + etcd**: Stores Service definition
+2. **Endpoints Controller**: Discovers Pods, creates Endpoints object
+3. **kube-proxy**: Watches Endpoints, programs network rules
+
+**Let's understand each in detail.**
+
+---
+
+### Component 1: API Server Stores the Service
+
+When you create a Service:
+
+```bash
+$ kubectl create service clusterip backend --tcp=80:8080
+```
+
+**What happens**:
+
+```yaml
+# API Server stores in etcd:
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+spec:
+  selector:
+    app: backend  # ← This selector is the KEY!
+  ports:
+  - port: 80
+    targetPort: 8080
+  type: ClusterIP
+  clusterIP: 10.96.0.20  # ← Allocated by API server
+```
+
+**At this point**:
+- Service object created in etcd
+- ClusterIP allocated (10.96.0.20)
+- **BUT**: No routing yet! No iptables rules! No Pod IPs known!
+
+The Service is just metadata - a configuration saying "I want a stable endpoint for Pods labeled `app=backend`"
+
+---
+
+### Component 2: Endpoints Controller Discovers the Pods
+
+**This is the critical missing piece! The Endpoints Controller is a separate component.**
+
+#### What is the Endpoints Controller?
+
+- **Separate from kube-proxy!**
+- Runs as part of kube-controller-manager
+- Job: Watch Services and Pods, match them up
+
+#### How It Works
+
+**The Endpoints Controller watches TWO things**:
+
+```mermaid
+sequenceDiagram
+    participant EC as Endpoints Controller
+    participant API as Kubernetes API
+    participant Pods as Pods
+    
+    EC->>API: Watch Services
+    EC->>API: Watch Pods
+    
+    Note over EC: Service "backend"<br/>created with<br/>selector: app=backend
+    
+    EC->>Pods: Find all Pods with<br/>label app=backend
+    
+    Note over Pods: Pod-1: 10.244.1.5 ✓<br/>Pod-2: 10.244.1.6 ✓<br/>Pod-3: 10.244.2.8 ✓
+    
+    EC->>API: Create Endpoints<br/>object "backend"
+    
+    Note over API: Endpoints: backend<br/>Addresses:<br/>- 10.244.1.5:8080<br/>- 10.244.1.6:8080<br/>- 10.244.2.8:8080
+```
+
+#### Step-by-Step: How Endpoints Get Created
+
+**1. Service created**:
+```yaml
+Service "backend":
+  selector:
+    app: backend
+  ports:
+  - port: 80
+    targetPort: 8080
+```
+
+**2. Endpoints Controller sees new Service**:
+```
+Endpoints Controller: "New Service 'backend' with selector app=backend"
+```
+
+**3. Endpoints Controller queries Pods**:
+```bash
+# Essentially does this:
+$ kubectl get pods -l app=backend -o wide
+NAME         IP            STATUS
+backend-1    10.244.1.5    Running
+backend-2    10.244.1.6    Running
+backend-3    10.244.2.8    Running
+```
+
+**4. Endpoints Controller creates Endpoints object**:
+```yaml
+apiVersion: v1
+kind: Endpoints  # ← Same name as Service!
+metadata:
+  name: backend
+subsets:
+- addresses:
+  - ip: 10.244.1.5
+  - ip: 10.244.1.6
+  - ip: 10.244.2.8
+  ports:
+  - port: 8080  # ← targetPort from Service
+```
+
+**You can see this**:
+```bash
+$ kubectl get endpoints backend
+NAME      ENDPOINTS
+backend   10.244.1.5:8080,10.244.1.6:8080,10.244.2.8:8080
+```
+
+#### The Relationship: Service ↔ Endpoints ↔ Pods
+
+```
+Service "backend"
+  ├─ ClusterIP: 10.96.0.20
+  ├─ Selector: app=backend
+  └─ Ports: 80 → 8080
+
+           ↓ (Endpoints Controller matches)
+
+Endpoints "backend"  ← Same name!
+  └─ Addresses:
+       ├─ 10.244.1.5:8080  (Pod backend-1)
+       ├─ 10.244.1.6:8080  (Pod backend-2)
+       └─ 10.244.2.8:8080  (Pod backend-3)
+
+           ↓ (kube-proxy reads this!)
+
+iptables rules:
+  10.96.0.20:80 → {10.244.1.5:8080, 10.244.1.6:8080, 10.244.2.8:8080}
+```
+
+**Key Insight**: The Endpoints object is the **bridge** between Service (stable VIP) and Pods (ephemeral IPs)!
+
+---
+
+### Component 3: kube-proxy Programs the Network Rules
+
+**Now we get to kube-proxy - but you can see it's the THIRD step, not the first!**
+
+#### What kube-proxy Actually Does
+
+**NOT what the name suggests**:
+- ❌ Does NOT proxy traffic (despite the name!)
+- ❌ Does NOT sit in the data path
+- ❌ Does NOT handle packets
+
+**What it ACTUALLY does**:
+- ✅ Watches Service objects
+- ✅ Watches Endpoints objects  ← This is where it gets Pod IPs!
+- ✅ Programs network rules (iptables/IPVS/eBPF)
+- ✅ Runs on EVERY node
+
+#### kube-proxy's Watch Loop
+
+**Pseudo-code of what kube-proxy does**:
+
+```go
+func (p *ProxyServer) Run() {
+    // Watch Services from API
+    serviceWatcher := p.client.Watch(Services)
+    go func() {
+        for event := range serviceWatcher {
+            switch event.Type {
+            case "ADDED":
+                p.onServiceAdd(event.Object)
+            case "UPDATED":
+                p.onServiceUpdate(event.Object)
+            case "DELETED":
+                p.onServiceDelete(event.Object)
+            }
+        }
+    }()
+    
+    // Watch Endpoints from API (THIS IS KEY!)
+    endpointsWatcher := p.client.Watch(Endpoints)
+    go func() {
+        for event := range endpointsWatcher {
+            switch event.Type {
+            case "ADDED":
+                p.onEndpointsAdd(event.Object)  // ← Gets Pod IPs here!
+            case "UPDATED":
+                p.onEndpointsUpdate(event.Object)
+            case "DELETED":
+                p.onEndpointsDelete(event.Object)
+            }
+        }
+    }()
+    
+    // Sync iptables periodically
+    go p.syncLoop()  // Every 30 seconds, reconcile rules
+}
+```
+
+#### How kube-proxy Discovers Pod IPs
+
+**Answer**: It watches the **Endpoints object**!
+
+```
+kube-proxy sees:
+  Endpoints "backend" ADDED
+  
+  Data:
+    Addresses:
+      - 10.244.1.5:8080
+      - 10.244.1.6:8080
+      - 10.244.2.8:8080
+
+kube-proxy action:
+  "Service backend needs rules for these 3 Pod IPs"
+  → Program iptables!
+```
+
+---
+
+### How kube-proxy Programs iptables Rules
+
+**This is the mechanism that creates the routing magic!**
+
+#### The iptables Update Process
+
+**Step 1: Read from Kubernetes API**
+
+kube-proxy maintains an in-memory model:
+
+```go
+type ServiceInfo struct {
+    ClusterIP string              // 10.96.0.20
+    Port int                       // 80
+    Endpoints []string             // [10.244.1.5:8080, ...]
+    Protocol string                // TCP
+}
+
+services := map[string]ServiceInfo{
+    "backend": {
+        ClusterIP: "10.96.0.20",
+        Port: 80,
+        Endpoints: ["10.244.1.5:8080", "10.244.1.6:8080", "10.244.2.8:8080"],
+    },
+}
+```
+
+**Step 2: Generate desired iptables rules**
+
+```bash
+# For Service "backend", kube-proxy generates:
+
+# Main Service chain (entrypoint)
+-A KUBE-SERVICES -d 10.96.0.20/32 -p tcp -m tcp --dport 80 -j KUBE-SVC-BACKEND
+
+# Service chain (load balancing)
+-A KUBE-SVC-BACKEND -m statistic --mode random --probability 0.33333 -j KUBE-SEP-POD1
+-A KUBE-SVC-BACKEND -m statistic --mode random --probability 0.50000 -j KUBE-SEP-POD2
+-A KUBE-SVC-BACKEND -j KUBE-SEP-POD3
+
+# Endpoint chains (DNAT to Pods)
+-A KUBE-SEP-POD1 -p tcp -j DNAT --to-destination 10.244.1.5:8080
+-A KUBE-SEP-POD2 -p tcp -j DNAT --to-destination 10.244.1.6:8080
+-A KUBE-SEP-POD3 -p tcp -j DNAT --to-destination 10.244.2.8:8080
+```
+
+**Step 3: Read current iptables state**
+
+```bash
+# kube-proxy executes:
+$ iptables-save > /tmp/current-rules
+```
+
+**Step 4: Compute diff**
+
+```
+Compare:
+  Current rules (from iptables-save)
+  Desired rules (from Services + Endpoints)
+
+Find:
+  - Rules to add
+  - Rules to delete
+  - Rules to modify
+```
+
+**Step 5: Apply changes atomically**
+
+```bash
+# kube-proxy executes:
+$ iptables-restore --noflush < /tmp/new-rules
+```
+
+**Why iptables-restore?**
+- Atomic: All rules applied at once
+- No partial state
+- Handles deletes + adds together
+
+---
+
+### Complete Service Creation Flow (End-to-End)
+
+Let's put it all together with a timeline:
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant API as API Server
+    participant EC as Endpoints Controller
+    participant KP as kube-proxy<br/>(on every node)
+    participant IPT as iptables
+
+    User->>API: kubectl create service backend
+    API->>API: Allocate ClusterIP:<br/>10.96.0.20
+    Note over API: Service object created<br/>in etcd
+    
+    EC->>API: Watch: Service ADDED
+    Note over EC: Query Pods with<br/>label app=backend
+    
+    EC->>API: Create Endpoints object<br/>IPs: 10.244.1.5, 10.244.1.6
+    
+    KP->>API: Watch: Service ADDED<br/>ClusterIP: 10.96.0.20
+    KP->>API: Watch: Endpoints ADDED<br/>IPs: 10.244.1.5, 10.244.1.6
+    
+    Note over KP: Build iptables rules:<br/>10.96.0.20:80 →<br/>10.244.1.5:8080<br/>10.244.1.6:8080
+    
+    KP->>IPT: iptables-restore
+    Note over IPT: Rules active!<br/>Service ready!
+```
+
+**Timeline**:
+
+```
+T+0ms:   User runs: kubectl create service backend
+T+10ms:  API Server creates Service object (ClusterIP: 10.96.0.20)
+T+15ms:  Endpoints Controller sees new Service
+T+20ms:  Endpoints Controller queries Pods (finds 3 Pods)
+T+25ms:  Endpoints Controller creates Endpoints object
+T+30ms:  kube-proxy (on Node-1) sees Service + Endpoints
+T+35ms:  kube-proxy programs iptables on Node-1
+T+30ms:  kube-proxy (on Node-2) sees Service + Endpoints
+T+35ms:  kube-proxy programs iptables on Node-2
+T+30ms:  kube-proxy (on Node-3) sees Service + Endpoints
+T+35ms:  kube-proxy programs iptables on Node-3
+T+40ms:  Service is LIVE! All nodes can route traffic!
+```
+
+**Happens in ~40 milliseconds!**
+
+---
+
+### What Happens When a Pod Dies?
+
+**This shows the complete update flow:**
+
+```
+10:00:00.000 - Pod backend-2 (10.244.1.6) crashes (OOMKilled)
+
+10:00:00.050 - kubelet on Node-1 detects Pod failure
+               Reports to API Server: Pod status → Failed
+
+10:00:00.100 - Endpoints Controller watches Pods
+               Sees: backend-2 status changed to Failed
+               
+10:00:00.150 - Endpoints Controller updates Endpoints object:
+               OLD: [10.244.1.5:8080, 10.244.1.6:8080, 10.244.2.8:8080]
+               NEW: [10.244.1.5:8080, 10.244.2.8:8080]  ← Removed .1.6
+
+10:00:00.200 - kube-proxy (on ALL nodes) watches Endpoints
+               Sees: Endpoints "backend" UPDATED
+               
+10:00:00.250 - kube-proxy regenerates iptables rules:
+               OLD chains:
+                 -A KUBE-SVC-BACKEND ... --probability 0.33 -j KUBE-SEP-POD1
+                 -A KUBE-SVC-BACKEND ... --probability 0.50 -j KUBE-SEP-POD2
+                 -A KUBE-SVC-BACKEND -j KUBE-SEP-POD3
+               
+               NEW chains:
+                 -A KUBE-SVC-BACKEND ... --probability 0.50 -j KUBE-SEP-POD1
+                 -A KUBE-SVC-BACKEND -j KUBE-SEP-POD3
+                 (KUBE-SEP-POD2 deleted!)
+
+10:00:00.300 - kube-proxy applies: iptables-restore
+               
+10:00:00.350 - Traffic automatically goes to remaining 2 Pods!
+```
+
+**From Pod death to routing update: ~350 milliseconds!**
+
+**Clients never notice** - existing connections continue, new connections go to healthy Pods.
+
+---
+
+### The Complete Architecture Diagram
+
+```mermaid
+graph TB
+    subgraph "Control Plane"
+        API[API Server + etcd<br/>Stores: Service + Endpoints]
+        EC[Endpoints Controller<br/>Watches: Services + Pods<br/>Creates: Endpoints]
+    end
+    
+    subgraph "Worker Node 1"
+        KP1[kube-proxy<br/>Watches: Services + Endpoints<br/>Programs: iptables]
+        IPT1[iptables rules]
+        Pod1[Pod-1<br/>10.244.1.5]
+        Pod2[Pod-2<br/>10.244.1.6]
+        KP1 --> IPT1
+    end
+    
+    subgraph "Worker Node 2"
+        KP2[kube-proxy<br/>Watches: Services + Endpoints<br/>Programs: iptables]
+        IPT2[iptables rules]
+        Pod3[Pod-3<br/>10.244.2.8]
+        KP2 --> IPT2
+    end
+    
+    API --> EC
+    API --> KP1
+    API --> KP2
+    
+    Pod1 -.-> |Matches selector| EC
+    Pod2 -.-> |Matches selector| EC
+    Pod3 -.-> |Matches selector| EC
+    
+    IPT1 -.-> |Routes to| Pod1
+    IPT1 -.-> |Routes to| Pod2
+    IPT1 -.-> |Routes to| Pod3
+    
+    IPT2 -.-> |Routes to| Pod1
+    IPT2 -.-> |Routes to| Pod2
+    IPT2 -.-> |Routes to| Pod3
+    
+    style EC fill:#f9f,stroke:#333,stroke-width:2px
+    style KP1 fill:#bbf,stroke:#333,stroke-width:2px
+    style KP2 fill:#bbf,stroke:#333,stroke-width:2px
+```
+
+**Key Takeaways**:
+1. **Endpoints Controller** discovers which Pods match Service selector
+2. **kube-proxy** watches Endpoints to know which Pod IPs to route to
+3. **iptables rules** do the actual packet routing (data plane)
+4. Everything happens automatically via Kubernetes watch API
+
+**Mystery solved!** kube-proxy doesn't "discover" Pods - it watches the Endpoints object that the Endpoints Controller maintains!
+
+---
+
 ## How Packets Travel: The Complete Picture
 
 Let's trace a **NodePort** request showing all three network layers:
