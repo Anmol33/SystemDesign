@@ -128,12 +128,12 @@ val avgAgeByCity = spark.read
 graph TB
     DF[DataFrame]
     Schema[Schema<br/>StructType]
-    Data[Distributed Data<br/>RDD[InternalRow]]
+    Data["Distributed Data<br/>RDD InternalRow"]
     
     DF --> Schema
     DF --> Data
     
-    Schema --> Fields[StructField: name, city, age<br/>Types: String, String, Int]
+    Schema --> Fields["StructField: name, city, age<br/>Types: String, String, Int"]
     Data --> Partitions[Partitions across executors]
     
     style DF fill:#e1f5fe
@@ -389,7 +389,7 @@ graph TB
     LogicalPlan[Logical Plan<br/>Abstract query]
     OptimizedPlan[Optimized Logical Plan<br/>Catalyst optimizations]
     PhysicalPlan[Physical Plan<br/>Executable strategy]
-    RDD[RDD[InternalRow]<br/>Actual execution]
+    RDD["RDD InternalRow<br/>Actual execution"]
     
     User --> LogicalPlan
     LogicalPlan --> OptimizedPlan
