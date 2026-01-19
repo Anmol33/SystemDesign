@@ -988,74 +988,92 @@ sequenceDiagram
 
 ## Shuffle Write Internals: Code-Level Deep Dive
 
-*This section dives into the actual code and data structures that make shuffle write work. We'll explore memory management, buffers, spilling, and the exact flow of bytes from records to disk files.*
+> **📖 What You'll Learn**: How shuffle write actually works—memory buffers, spilling, and the journey from records to disk files.
 
-### ExternalSorter: The Heart of Shuffle Write
+### ExternalSorter: The Memory Manager
 
-When `SortShuffleWriter` writes shuffle data, it delegates to **`ExternalSorter`**—a critical component that manages in-memory sorting, memory pressure detection, and disk spilling.
+**In simple terms**: ExternalSorter is Spark's traffic controller for shuffle data. It decides what stays in memory and what spills to disk.
 
-**Location**: [`core/src/main/scala/org/apache/spark/util/collection/ExternalSorter.scala`](https://github.com/apache/spark/blob/master/core/src/main/scala/org/apache/spark/util/collection/ExternalSorter.scala)
+**Location**: [`ExternalSorter.scala`](https://github.com/apache/spark/blob/master/core/src/main/scala/org/apache/spark/util/collection/ExternalSorter.scala)
+
+**What it does**:
+- Manages in-memory sorting of shuffle data
+- Detects when memory is running low
+- Spills data to disk when needed
+- Merges spilled files at the end
 
 ![ExternalSorter Memory Structure](./images/shuffle_external_sorter_memory.png)
 
+---
+
 #### The Data Structure: PartitionedPairBuffer
 
-`ExternalSorter` stores records in a **`PartitionedPairBuffer`** when there's no combiner (like in `groupByKey`):
+**Used by**: `groupByKey()` and similar operations (ones without combiners)
+
+**What it stores**:
 
 ```scala
 private var buffer = new PartitionedPairBuffer[K, V]
 ```
 
-**What is this?** A growable array that stores tuples of:
-- **Partition ID** (4 bytes - int)
-- **Key** (8 bytes - object reference)
-- **Value** (8 bytes - object reference)
+Each record takes 20 bytes of overhead:
 
-**Memory layout**:
+| Component | Size | Purpose |
+|-----------|------|---------|
+| Partition ID | 4 bytes | Which reducer gets this record |
+| Key reference | 8 bytes | Pointer to the key object |
+| Value reference | 8 bytes | Pointer to the value object |
+| **Total** | **20 bytes** | Just for tracking! |
+
+**Memory layout** (visual):
 ```
-Array backing the buffer:
+Array structure:
 ┌──────────┬────────┬──────────┬──────────┬────────┬──────────┐
 │partId_0  │ key_0  │ value_0  │partId_1  │ key_1  │ value_1  │
-│ (4 bytes)│(8 bytes)│(8 bytes) │(4 bytes) │(8 bytes)│(8 bytes) │
+│ 4 bytes  │8 bytes │ 8 bytes  │ 4 bytes  │8 bytes │ 8 bytes  │
 └──────────┴────────┴──────────┴──────────┴────────┴──────────┘
-Index: 0         1        2         3         4        5
 ```
 
-**Key characteristics**:
-- **Initial capacity**: 64 elements = 192 array slots
-- **Growth strategy**: Doubles when full (64 → 128 → 256 → 512 → ...)
-- **Memory per record**: 20 bytes overhead (4 + 8 + 8)
+**Growth behavior**:
+- Starts with **64 elements** (192 array slots)
+- Doubles when full: 64 → 128 → 256 → 512 → ...
+- Each growth requires copying all existing data
 
-#### Memory Calculation
+---
 
-**For each record inserted**:
+#### Memory Calculation: A Real Example
 
-```
-Memory needed in PartitionedPairBuffer:
-  ├─ Partition ID:  4 bytes
-  ├─ Key reference:  8 bytes  
-  └─ Value reference: 8 bytes
-  ────────────────────────────
-  Total overhead:   20 bytes per record
+**Scenario**: 1 million records with average sizes:
+- Key: 100 bytes (e.g., customer ID string)
+- Value: 200 bytes (e.g., transaction data)
 
-PLUS the actual objects (stored separately in heap):
-  ├─ Key object:    varies (e.g., 50 bytes for String)
-  └─ Value object:  varies (e.g., 100 bytes)
-```
-
-**Real example**: 1 million records with 100-byte keys and 200-byte values
+**Calculation**:
 
 ```
-Buffer overhead:  1,000,000 × 20 bytes     = 20 MB
-Actual keys:      1,000,000 × 100 bytes    = 100 MB
-Actual values:    1,000,000 × 200 bytes    = 200 MB
-──────────────────────────────────────────────────
-Total memory:                               320 MB
+Buffer tracking overhead:
+  1,000,000 records × 20 bytes     = 20 MB
+
+Actual data:
+  Keys:   1,000,000 × 100 bytes    = 100 MB
+  Values: 1,000,000 × 200 bytes    = 200 MB
+
+Total memory needed:                 320 MB
 ```
 
-**If executor only has 200 MB execution memory → Spilling required!**
+> **⚠️ Memory Warning**: If your executor only has 200 MB execution memory, **spilling will occur**!
 
-#### How Write Works: Step-by-Step Code Flow
+**Quick formula**:
+```
+Total Memory = (Records × 20 bytes) + (Records × Average Key Size) + (Records × Average Value Size)
+```
+
+---
+
+#### How Write Works: The Complete Flow
+
+**Here's what happens when you call** `groupByKey()` or `reduceByKey()`:
+
+**Step 1**: Spark calls `insertAll()` in ExternalSorter
 
 From [`ExternalSorter.scala:182-216`](https://github.com/apache/spark/blob/master/core/src/main/scala/org/apache/spark/util/collection/ExternalSorter.scala#L182-L216):
 
@@ -1063,137 +1081,113 @@ From [`ExternalSorter.scala:182-216`](https://github.com/apache/spark/blob/maste
 def insertAll(records: Iterator[Product2[K, V]]): Unit = {
   val shouldCombine = aggregator.isDefined
   
+  // PATH 1: reduceByKey (with combiner)
   if (shouldCombine) {
-    // reduceByKey path: use PartitionedAppendOnlyMap with combiners
-    val combiners = new PartitionedAppendOnlyMap[K, C]
+    val combiners = new PartitionedAppendOnlyMap[K, C]  // Hash map!
     
     while (records.hasNext) {
-      val record = records.next()
-      val key = record._1
-      val value = record._2
-      
-      // Map-side aggregation happens HERE
-      combiners.changeValue(
-        (partitioner.getPartition(key), key),
-        value,
-        aggregator.mergeValue,      // Combine values
-        aggregator.createCombiner    // Create initial value
-      )
-      
-      // Check memory pressure and spill if needed
-      maybeSpillCollection(combiners)
+      ...
+      // ✨ Map-side aggregation happens HERE
+      combiners.changeValue(key, value, aggregator.mergeValue)
+      maybeSpillCollection(combiners)  // Check memory
     }
-  } else {
-    // groupByKey path: use PartitionedPairBuffer (NO aggregation)
+  } 
+  
+  // PATH 2: groupByKey (no combiner)
+  else {
     while (records.hasNext) {
-      val record = records.next()
-      val key = record._1
-      
-      // Check if buffer needs to grow
+      ...
       val growAmount = buffer.growIfNeeded()
       
       if (growAmount > 0) {
-        // Try to acquire memory for growth
         val acquired = taskMemoryManager.acquireExecutionMemory(growAmount)
         
         if (acquired < growAmount) {
-          // Not enough memory! SPILL TO DISK
-          spill(buffer)
-          buffer.clear()
-          
-          // Try again (should succeed now)
-          taskMemoryManager.acquireExecutionMemory(growAmount)
+          spill(buffer)          // 💾 SPILL TO DISK
+          buffer.clear()         // Free memory
         }
       }
       
-      // Insert record (partition ID, key, value)
-      buffer.insert(partitioner.getPartition(key), key, record._2)
+      buffer.insert(partitionId, key, value)  // Store all values
     }
   }
 }
 ```
 
-**Critical observations**:
+> **💡 Key Insights**:
+> - **`reduceByKey`** uses a hash map (`PartitionedAppendOnlyMap`) and combines values immediately
+> - **`groupByKey`** uses an array (`PartitionedPairBuffer`) and stores ALL values
+> - Memory is checked **before** every insert to avoid OOM
+> - If memory runs out → automatic spill to disk
 
-1. **Two different data structures**:
-   - `reduceByKey` → `PartitionedAppendOnlyMap` (hash map with combiners)
-   - `groupByKey` → `PartitionedPairBuffer` (plain array, all values stored)
+**Step 2**: Different paths for different operations
 
-2. **Memory is checked BEFORE insert**:
-   - `acquireExecutionMemory()` requests memory from `TaskMemoryManager`
-   - If insufficient → automatic spill triggered
-   - Buffer cleared, memory freed, operation retries
+| Operation | Data Structure | Behavior | Memory Efficiency |
+|-----------|---------------|----------|-------------------|
+| `reduceByKey` | PartitionedAppendOnlyMap | Combines values on insert | ✅ High (1 value per key) |
+| `groupByKey` | PartitionedPairBuffer | Stores all values | ❌ Low (all values buffered) |
 
-3. **Map-side aggregation** happens in the `if (shouldCombine)` branch:
-   - Values combined using `aggregator.mergeValue`
-   - Reduces data volume BEFORE shuffle
-   - This is why `reduceByKey` is faster!
+This is **why `reduceByKey` is faster**—it reduces data volume before shuffle!
 
-#### Spilling: When Buffer Overflows
+---
 
-**Trigger conditions**:
-1. Buffer needs to grow but memory acquisition fails
-2. Estimated size exceeds available execution memory  
-3. Manual spill triggered by memory pressure from other tasks
+#### Spilling: When Memory Runs Out
 
-**Spill process** from [`ExternalSorter.scala:547-612`](https://github.com/apache/spark/blob/master/core/src/main/scala/org/apache/spark/util/collection/ExternalSorter.scala#L547-L612):
+**What is spilling?** Writing in-memory data to disk when RAM is full.
+
+**When it happens**:
+
+**Three triggers for spilling**:
+1. ❌ Buffer needs to grow but memory request fails
+2. ❌ Estimated size exceeds available execution memory
+3. ❌ Memory pressure from other concurrent tasks
+
+**The spill process** ([`ExternalSorter.scala:547-612`](https://github.com/apache/spark/blob/master/core/src/main/scala/org/apache/spark/util/collection/ExternalSorter.scala#L547-L612)):
 
 ```scala
-override protected def spill(collection: WritablePartitionedPairCollection[K, C]): Long = {
-  // Step 1: Sort by partition ID in-place (no extra memory!)
+override protected def spill(...): Long = {
+  // Step 1: Sort in-place (no extra memory needed!)
   val it = collection.destructiveSortedWritablePartitionedIterator(comparator)
   
-  // Step 2: Create temporary spill file
+  // Step 2: Create temp file
   val (blockId, file) = blockManager.diskBlockManager.createTempLocalBlock()
   
-  // Step 3: Write sorted data to disk
-  val writer = blockManager.getDiskWriter(blockId, file, serializerInstance, ...)
-  var bytesSpilled = 0L
-  var elementsSpilled = 0L
-  
+  // Step 3: Write to disk
+  val writer = blockManager.getDiskWriter(blockId, file, ...)
   while (it.hasNext) {
-    val (partition, key, value) = it.next()
-    
-    // Serialize key and value to bytes
-    writer.write(key, value)
-    
-    elementsSpilled += 1
-    bytesSpilled = writer.committedPosition
+    writer.write(key, value)  // Serialize and write
+    ...
   }
   
-  writer.commitAndGet()
-  writer.close()
+  // Step 4: Track for later merge
+  spills += SpilledFile(file, blockId, ...)
   
-  // Step 4: Track spill file for later merging
-  spills += SpilledFile(file, blockId, batchSizes, elementsPerPartition)
-  
-  logInfo(s"Spilled $bytesSpilled bytes from ${elementsSpilled} records")
-  
-  bytesSpilled
+  logInfo(s"Spilled $bytesSpilled bytes")  // You'll see this in logs!
 }
 ```
 
-**What happens during spill**:
-1. **In-place sort** by partition ID (memory efficient!)
-2. Create temp file: `temp_local_<UUID>`
-3. Serialize records to bytes and write sequentially
-4. Track spill file metadata for final merge
-5. Clear in-memory buffer to free memory
+> **📝 What Just Happened**: 
+> 1. Sort data by partition ID (in-place, memory efficient)
+> 2. Create temporary file: `temp_local_<UUID>`
+> 3. Serialize & write records sequentially
+> 4. Track spilled file for final merge
+> 5. Clear in-memory buffer (frees RAM)
 
-**Performance impact**:
+**Performance Impact: Real Numbers**
 
-| Scenario | Memory Available | Shuffle Data Size | Spills | Write Performance |
-|----------|-----------------|-------------------|--------|-------------------|
-| **Best case** | 2 GB | 1 GB | 0 | **Fast** - in-memory sort only |
-| **One spill** | 1 GB | 2 GB | 1 | **Medium** - 1 disk write + 1 merge read |
-| **Many spills** | 500 MB | 10 GB | 20+ | **Slow** - 20+ disk writes + merge-sort all files |
+| Spills | Memory | Data Size | Performance | Why |
+|--------|--------|-----------|-------------|-----|
+| **0** ✅ | 2 GB | 1 GB | **Fast** | In-memory sort only |
+| **1** ⚠️ | 1 GB | 2 GB | **Medium** | 1 disk write + 1 merge |
+| **20+** ❌ | 500 MB | 10 GB | **Slow** | Many writes + expensive merge |
 
-**Real logs showing spills**:
-```
-INFO ExternalSorter: Spilling in-memory map of 245.7 MB to disk (1 time so far)
-INFO ExternalSorter: Spilling in-memory map of 312.4 MB to disk (2 times so far)
-INFO ExternalSorter: Spilling in-memory map of 198.3 MB to disk (3 times so far)
-```
+> **⚠️ Watch Your Logs**: Look for these messages:
+> ```
+> INFO ExternalSorter: Spilling in-memory map of 245.7 MB to disk (1 time so far)
+> INFO ExternalSorter: Spilling in-memory map of 312.4 MB to disk (2 times so far)
+> ```
+> 
+> If you see "3 times" or more → **You have a memory problem!**
 
 #### The Final Merge
 
@@ -1233,24 +1227,27 @@ Example with 20 spills:
 Very memory efficient!
 ```
 
-#### Configuration Impact on Spilling
+#### Configuration: Controlling Spilling
 
-**Execution memory available to each task**:
+**How much memory does each task get?**
 
-```scala
-val executionMemory = 
-  (heapSize - 300MB) × 
-  spark.memory.fraction × 
-  (1 - spark.memory.storageFraction) / 
-  numConcurrentTasks
-
-// Example: 10 GB heap, 4 concurrent tasks, default config
-= (10GB - 300MB) × 0.6 × 0.5 / 4
-= 9.7GB × 0.6 × 0.5 / 4
-= 5.82GB × 0.5 / 4
-= 2.91GB / 4
-≈ 725 MB per task
 ```
+Memory per task = (Heap - 300MB) × memory.fraction × (1 - storageFraction) / numTasks
+                           ↓              ↓                    ↓              ↓
+                      Executor JVM      60%              50% for execution    Cores
+```
+
+**Real example**: 10 GB heap, 4 cores, default config
+
+```
+Step 1: 10 GB - 300 MB      = 9.7 GB
+Step 2: 9.7 GB × 0.6        = 5.82 GB  (Spark gets 60%)
+Step 3: 5.82 GB × 0.5       = 2.91 GB  (Execution gets 50%)
+Step 4: 2.91 GB / 4 tasks   = 725 MB per task
+```
+
+> **💡 Key Insight**: With 4 cores, each task only gets **725 MB**!
+> If your shuffle needs more → spilling occurs.
 
 **Key configuration parameters**:
 
